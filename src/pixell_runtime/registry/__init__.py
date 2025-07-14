@@ -1,0 +1,1 @@
+"""Registry module for package discovery and management."""
