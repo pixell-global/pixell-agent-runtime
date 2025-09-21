@@ -1,0 +1,248 @@
+version: "0.1.0"
+name: "pixell-python-agent"
+display_name: "Pixell Python Agent"
+description: "Comprehensive Python code execution service for all AI Agents"
+author: "Pixell Platform Team"
+license: "MIT"
+
+# Entry point for the agent
+entrypoint: "src.pixell_adapter:main"
+
+# Agent capabilities
+capabilities:
+  - "code-execution"
+  - "python-runtime"
+  - "data-analysis"
+  - "machine-learning"
+  - "visualization"
+  - "error-recovery"
+  - "session-management"
+
+# Runtime environment (must be one of: python3.9, python3.11, node18, node20, go1.21)
+runtime: "python3.11"
+
+# Environment variables
+environment:
+  PYTHONUNBUFFERED: "1"
+  A2A_PORT: "${A2A_PORT:-50051}"
+  USE_UNIX_SOCKET: "${USE_UNIX_SOCKET:-true}"
+
+# Dependencies
+dependencies:
+  - grpcio>=1.60.0
+  - grpcio-tools>=1.60.0
+  - protobuf>=4.25.0
+  - aiofiles>=23.2.1
+  - msgpack>=1.0.7
+  - prometheus-client>=0.19.0
+  - structlog>=24.1.0
+  - docker>=6.1.3
+
+# MCP server configuration
+mcp:
+  enabled: true
+  config_file: "mcp.json"
+
+# Extended metadata for registry
+metadata:
+  version: "0.1.0"
+  homepage: "https://github.com/pixell/pixell-python-agent"
+  extensive_description: |
+    The Pixell Python Execution Agent is a specialized A2A (Agent-to-Agent) service that provides 
+    secure, high-performance Python code execution capabilities to other agents in the Pixell ecosystem.
+    
+    **Key Features:**
+    
+    🚀 **Lightning Performance**
+    - <100ms container startup (10x faster than VMs)
+    - <1ms local A2A latency via Unix sockets
+    - Pre-warmed container pools for instant execution
+    - Supports 1000+ concurrent executions per node
+    
+    🧠 **Smart Execution Engine (U-P-E-E)**
+    - **Understand**: Analyzes code patterns and data shapes
+    - **Plan**: Optimizes execution strategy and resource allocation
+    - **Execute**: Runs code in secure, isolated containers
+    - **Evaluate**: Detects errors and automatically retries with fixes
+    
+    📊 **Data Science Ready**
+    - 400+ pre-installed packages (numpy, pandas, scikit-learn, etc.)
+    - Handles datasets up to 1GB per file
+    - Resource tiers: Small (1CPU/2GB), Medium (2CPU/4GB), Large (4CPU/16GB)
+    - Automatic memory optimization for large datasets
+    
+    🔒 **Enterprise Security**
+    - Container isolation with read-only filesystem
+    - No network access by default
+    - Seccomp filters for system call restrictions
+    - A2A authentication via mTLS
+    
+    💾 **Stateful Sessions**
+    - 90-minute session persistence
+    - Variable sharing between executions
+    - Context preservation across A2A calls
+    - Zero-copy data structures for efficiency
+    
+    📡 **Real-time Streaming**
+    - Bidirectional gRPC streams for progressive output
+    - Sub-5ms latency for output streaming
+    - Progress updates for long-running operations
+    
+    **Use Cases:**
+    - Data analysis and transformation
+    - Machine learning model training/inference
+    - Report generation and visualization
+    - Scientific computing
+    - Automated data processing pipelines
+    
+    **Advantages over ChatGPT Code Interpreter:**
+    - 10x faster execution with container pre-warming
+    - 2x higher file size limits (1GB vs 512MB)
+    - 8x more RAM available (up to 16GB)
+    - Automatic error recovery with context-aware fixes
+    - Native A2A integration for seamless agent collaboration
+  
+  tags:
+    - "python"
+    - "code-execution"
+    - "data-science"
+    - "machine-learning"
+    - "jupyter-alternative"
+    - "code-interpreter"
+    - "a2a-protocol"
+    - "high-performance"
+    - "container-based"
+    - "stateful-execution"
+  
+  sub_agents:
+    - name: "code-executor"
+      description: "Execute Python code with full session state"
+      endpoint: "/execute"
+      capabilities: ["python-execution", "session-management", "error-recovery"]
+      public: true
+    
+    - name: "stream-executor"
+      description: "Execute code with real-time streaming output"
+      endpoint: "/stream"
+      capabilities: ["streaming-execution", "progress-tracking", "real-time-output"]
+      public: true
+    
+    - name: "data-analyzer"
+      description: "Specialized data analysis with pandas/numpy optimization"
+      endpoint: "/analyze"
+      capabilities: ["data-analysis", "dataframe-operations", "statistical-computing"]
+      public: true
+    
+    - name: "ml-runner"
+      description: "Machine learning model training and inference"
+      endpoint: "/ml"
+      capabilities: ["model-training", "inference", "gpu-support"]
+      public: false
+  
+  usage_guide: |
+    ## A2A Integration (Primary Interface)
+    
+    The Python Execution Agent is designed to be called by other agents via the A2A protocol:
+    
+    ```python
+    # From another Pixell agent
+    import grpc
+    from pixell.a2a import python_agent_pb2, python_agent_pb2_grpc
+    
+    # Connect via Unix socket (recommended for local)
+    channel = grpc.insecure_channel('unix:///tmp/pixell-python-agent-50051.sock')
+    stub = python_agent_pb2_grpc.PythonAgentStub(channel)
+    
+    # Execute code with context
+    request = python_agent_pb2.ExecuteRequest(
+        code="result = df.groupby('category').sum()",
+        context={"df": serialized_dataframe},
+        session_id="analysis-session-1",
+        resource_tier=python_agent_pb2.MEDIUM
+    )
+    
+    response = stub.Execute(request)
+    print(f"Result: {response.results}")
+    ```
+    
+    ## Streaming Execution
+    
+    For long-running operations with real-time output:
+    
+    ```python
+    # Stream execution results
+    async for chunk in stub.StreamExecute(request):
+        if chunk.type == StreamChunk.STDOUT:
+            print(chunk.data.decode(), end='')
+        elif chunk.type == StreamChunk.RESULT:
+            process_result(chunk.data)
+    ```
+    
+    ## Session Management
+    
+    Maintain state across multiple executions:
+    
+    ```python
+    # First call - initialize data
+    request1 = ExecuteRequest(
+        code="data = load_dataset('sales.csv')",
+        session_id="session-123"
+    )
+    stub.Execute(request1)
+    
+    # Second call - use previous state
+    request2 = ExecuteRequest(
+        code="summary = data.describe()",
+        session_id="session-123"  # Same session
+    )
+    response = stub.Execute(request2)
+    ```
+    
+    ## Resource Tiers
+    
+    Choose appropriate resources for your workload:
+    - **SMALL**: Quick scripts, simple calculations (1 CPU, 2GB RAM)
+    - **MEDIUM**: Data processing, standard ML (2 CPU, 4GB RAM)  
+    - **LARGE**: Big data, deep learning (4 CPU, 16GB RAM)
+    
+    ## Error Recovery
+    
+    The agent automatically retries common errors:
+    - Memory errors → Switches to chunked processing
+    - Key errors → Adds existence checks
+    - Type errors → Attempts type conversion
+  
+  examples:
+    - title: "Basic Python Execution"
+      code: |
+        {
+          "code": "print('Hello from Python!')\nresult = sum([1, 2, 3, 4, 5])",
+          "session_id": "demo-1",
+          "resource_tier": 0
+        }
+    
+    - title: "Data Analysis with Pandas"
+      code: |
+        {
+          "code": "import pandas as pd\ndf = pd.DataFrame({'A': [1,2,3], 'B': [4,5,6]})\nresult = df.describe()",
+          "session_id": "analysis-1",
+          "resource_tier": 1
+        }
+    
+    - title: "Machine Learning Pipeline"
+      code: |
+        {
+          "code": "from sklearn.ensemble import RandomForestClassifier\nmodel = RandomForestClassifier()\nmodel.fit(X_train, y_train)\nscore = model.score(X_test, y_test)",
+          "context": {"X_train": "...", "y_train": "...", "X_test": "...", "y_test": "..."},
+          "session_id": "ml-1",
+          "resource_tier": 2
+        }
+    
+    - title: "Streaming Long Operation"
+      code: |
+        # Use StreamExecute for progress tracking
+        {
+          "code": "for i in range(100):\n    print(f'Processing {i}%')\n    process_batch(i)",
+          "session_id": "batch-1",
+          "timeout_seconds": 300
+        }

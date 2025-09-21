@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package pixell.python_agent;
+
+service PythonAgent {
+  // Primary execution method
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  
+  // Streaming execution for real-time output
+  rpc StreamExecute(ExecuteRequest) returns (stream StreamChunk);
+  
+  // Get session state
+  rpc GetSessionState(SessionStateRequest) returns (SessionStateResponse);
+  
+  // Retry with patch
+  rpc RetryWithPatch(RetryRequest) returns (ExecuteResponse);
+}
+
+message ExecuteRequest {
+  string code = 1;
+  map<string, bytes> context = 2;  // Serialized context variables
+  repeated bytes files = 3;
+  string session_id = 4;
+  ResourceTier resource_tier = 5;
+  int32 timeout_seconds = 6;
+}
+
+message ExecuteResponse {
+  bool success = 1;
+  string stdout = 2;
+  string stderr = 3;
+  map<string, bytes> results = 4;  // Serialized results
+  string error = 5;
+  ExecutionMetrics metrics = 6;
+}
+
+message StreamChunk {
+  ChunkType type = 1;
+  bytes data = 2;
+  int64 timestamp = 3;
+  
+  enum ChunkType {
+    STDOUT = 0;
+    STDERR = 1;
+    RESULT = 2;
+    PROGRESS = 3;
+    ERROR = 4;
+  }
+}
+
+message SessionStateRequest {
+  string session_id = 1;
+}
+
+message SessionStateResponse {
+  map<string, bytes> variables = 1;
+  int64 created_at = 2;
+  int64 last_accessed = 3;
+}
+
+message RetryRequest {
+  string session_id = 1;
+  CodePatch patch = 2;
+}
+
+message CodePatch {
+  repeated LineEdit edits = 1;
+  
+  message LineEdit {
+    int32 line_number = 1;
+    string old_line = 2;
+    string new_line = 3;
+  }
+}
+
+message ExecutionMetrics {
+  int64 execution_time_ms = 1;
+  int64 memory_used_bytes = 2;
+  int32 cpu_percent = 3;
+}
+
+enum ResourceTier {
+  SMALL = 0;   // 1 CPU, 2GB RAM
+  MEDIUM = 1;  // 2 CPU, 4GB RAM
+  LARGE = 2;   // 4 CPU, 16GB RAM
+}

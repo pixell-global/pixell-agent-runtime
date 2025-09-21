@@ -31,6 +31,25 @@ class AgentExport(BaseModel):
     output_schema: Optional[Dict[str, Any]] = Field(None, description="JSON Schema for output")
 
 
+class A2AConfig(BaseModel):
+    """A2A (gRPC) configuration."""
+    
+    service: Optional[str] = Field(None, description="gRPC server entry (exports createGrpcServer())")
+
+
+class RESTConfig(BaseModel):
+    """REST API configuration."""
+    
+    entry: Optional[str] = Field(None, description="REST entry point (exports mount(app) to attach routes)")
+
+
+class UIConfig(BaseModel):
+    """UI serving configuration."""
+    
+    path: Optional[str] = Field(None, description="Folder with built static assets (index.html at least)")
+    basePath: str = Field("/", description="Optional mount path")
+
+
 class AgentManifest(BaseModel):
     """Agent package manifest (agent.yaml)."""
     
@@ -41,6 +60,13 @@ class AgentManifest(BaseModel):
     author: Optional[str] = Field(None, description="Package author")
     exports: List[AgentExport] = Field(..., description="Exported agents")
     dependencies: Optional[List[str]] = Field(default_factory=list, description="Python dependencies")
+    entrypoint: Optional[str] = Field(None, description="Main entrypoint (module:function)")
+    main_module: Optional[str] = Field(None, description="Main module name")
+    
+    # Three-surface runtime configuration
+    a2a: Optional[A2AConfig] = Field(None, description="A2A (gRPC) configuration")
+    rest: Optional[RESTConfig] = Field(None, description="REST API configuration")
+    ui: Optional[UIConfig] = Field(None, description="UI serving configuration")
     
     @validator("runtime_version")
     def validate_runtime_version(cls, v: str) -> str:

@@ -1,0 +1,63 @@
+{
+  "name": "pixell-python-agent",
+  "version": "0.1.0",
+  "description": "Pixell Python Agent MCP Server",
+  "protocol": "stdio",
+  "runtime": "python",
+  "command": {
+    "command": "python",
+    "args": ["-m", "src.pixell_adapter"]
+  },
+  "capabilities": {
+    "tools": {
+      "execute_python": {
+        "description": "Execute Python code in a secure container",
+        "parameters": {
+          "code": {
+            "type": "string",
+            "description": "Python code to execute"
+          },
+          "session_id": {
+            "type": "string",
+            "description": "Session ID for stateful execution",
+            "default": "default"
+          },
+          "resource_tier": {
+            "type": "string",
+            "enum": ["small", "medium", "large"],
+            "description": "Resource allocation tier",
+            "default": "small"
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Execution timeout in seconds",
+            "default": 60
+          }
+        }
+      },
+      "stream_execute": {
+        "description": "Execute Python code with streaming output",
+        "parameters": {
+          "code": {
+            "type": "string",
+            "description": "Python code to execute"
+          },
+          "session_id": {
+            "type": "string",
+            "description": "Session ID for stateful execution",
+            "default": "default"
+          }
+        }
+      },
+      "get_session_state": {
+        "description": "Get variables from a session",
+        "parameters": {
+          "session_id": {
+            "type": "string",
+            "description": "Session ID to query"
+          }
+        }
+      }
+    }
+  }
+}

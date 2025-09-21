@@ -14,7 +14,7 @@ import structlog
 import yaml
 
 from pixell_runtime.core.exceptions import PackageLoadError, PackageValidationError
-from pixell_runtime.core.models import AgentExport, AgentManifest, AgentPackage, AgentStatus
+from pixell_runtime.core.models import AgentExport, AgentManifest, AgentPackage, AgentStatus, A2AConfig, RESTConfig, UIConfig
 
 logger = structlog.get_logger()
 
@@ -153,13 +153,36 @@ class PackageLoader:
             )
             exports.append(export)
         
+        # Parse three-surface configuration
+        a2a_config = None
+        if "a2a" in manifest_data:
+            a2a_data = manifest_data["a2a"]
+            a2a_config = A2AConfig(service=a2a_data.get("service"))
+        
+        rest_config = None
+        if "rest" in manifest_data:
+            rest_data = manifest_data["rest"]
+            rest_config = RESTConfig(entry=rest_data.get("entry"))
+        
+        ui_config = None
+        if "ui" in manifest_data:
+            ui_data = manifest_data["ui"]
+            ui_config = UIConfig(
+                path=ui_data.get("path"),
+                basePath=ui_data.get("basePath", "/")
+            )
+        
         # Create manifest
         return AgentManifest(
             name=name,
             version=version,
+            entrypoint=manifest_data.get("entrypoint"),
             runtime_version="0.1.0",  # Default for now
             description=description,
             author=author,
             exports=exports,
-            dependencies=manifest_data.get("dependencies", [])
+            dependencies=manifest_data.get("dependencies", []),
+            a2a=a2a_config,
+            rest=rest_config,
+            ui=ui_config
         )

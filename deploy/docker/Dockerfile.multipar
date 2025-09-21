@@ -1,0 +1,35 @@
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY src/ ./src/
+COPY setup.py .
+COPY pyproject.toml .
+
+# Install the package
+RUN pip install -e .
+
+# Create directories for packages and runtime
+RUN mkdir -p /tmp/pixell-runtime/packages
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PAR_MODE=supervisor
+ENV SUPERVISOR_PORT=80
+
+# Expose supervisor port
+EXPOSE 80
+
+# Start supervisor
+CMD ["python", "-m", "src.run_supervisor"]

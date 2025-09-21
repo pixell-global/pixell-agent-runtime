@@ -1,0 +1,23 @@
+name: example-three-surface-agent
+version: 0.1.0
+description: Example agent demonstrating all three surfaces
+entrypoint: main:handler
+
+# A2A (gRPC) configuration
+a2a:
+  service: a2a_service:create_grpc_server
+
+# REST API configuration  
+rest:
+  entry: rest_routes:mount
+
+# UI configuration
+ui:
+  path: ui
+  basePath: /
+
+metadata:
+  sub_agents:
+    - name: example_agent
+      description: Example agent with three surfaces
+      public: true

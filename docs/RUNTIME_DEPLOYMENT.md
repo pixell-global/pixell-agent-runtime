@@ -21,7 +21,8 @@
 
 4. **Docker Image**
    - Built and pushed to ECR: `636212886452.dkr.ecr.us-east-1.amazonaws.com/pixell-runtime:latest`
-   - Also tagged with commit SHA: `96e22c6`
+   - Also tagged with commit SHA: `97a63d3`
+   - Image digest: `sha256:e22a1f40248e0e2ea4e7094101acf947f6ead214477facd52e6999583ccd5ff1`
 
 ## Running the Python Agent
 

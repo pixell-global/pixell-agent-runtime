@@ -1,0 +1,142 @@
+"""UI serving implementation."""
+
+import os
+from pathlib import Path
+from typing import Optional
+
+import structlog
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
+from pixell_runtime.core.models import AgentPackage
+
+logger = structlog.get_logger()
+
+
+def setup_ui_routes(app: FastAPI, package: AgentPackage):
+    """Setup UI routes for serving static assets.
+    
+    Args:
+        app: FastAPI application
+        package: Agent package with UI configuration
+    """
+    if not package.manifest.ui or not package.manifest.ui.path:
+        logger.warning("No UI configuration found in package")
+        return
+    
+    ui_path = Path(package.path) / package.manifest.ui.path
+    base_path = package.manifest.ui.basePath or "/"
+    
+    if not ui_path.exists():
+        logger.error("UI path does not exist", ui_path=str(ui_path))
+        return
+    
+    # Ensure base_path starts and ends with /
+    if not base_path.startswith("/"):
+        base_path = "/" + base_path
+    if not base_path.endswith("/"):
+        base_path = base_path + "/"
+    
+    logger.info("Setting up UI routes", ui_path=str(ui_path), base_path=base_path)
+    
+    # Mount static files if directory exists
+    static_dir = ui_path / "static"
+    if static_dir.exists() and static_dir.is_dir():
+        app.mount(
+            f"{base_path}static",
+            StaticFiles(directory=str(static_dir)),
+            name="ui_static"
+        )
+    
+    # Serve index.html for all routes under base_path
+    @app.get(f"{base_path}{{path:path}}")
+    async def serve_ui(path: str, request: Request):
+        """Serve UI files with SPA routing support."""
+        # If it's a file request (has extension), serve the actual file
+        if "." in path and not path.endswith("/"):
+            file_path = ui_path / path
+            if file_path.exists() and file_path.is_file():
+                return FileResponse(str(file_path))
+        
+        # For SPA routing, serve index.html for all other requests
+        index_file = ui_path / "index.html"
+        if index_file.exists():
+            return FileResponse(str(index_file))
+        
+        raise HTTPException(status_code=404, detail="UI not found")
+    
+    # Serve index.html at the base path
+    @app.get(base_path)
+    async def serve_index():
+        """Serve the main index.html file."""
+        index_file = ui_path / "index.html"
+        if index_file.exists():
+            return FileResponse(str(index_file))
+        
+        raise HTTPException(status_code=404, detail="UI index.html not found")
+
+
+def create_ui_app(package: AgentPackage, port: int = 3000) -> FastAPI:
+    """Create a standalone UI server application.
+    
+    Args:
+        package: Agent package with UI configuration
+        port: Port for the UI server
+        
+    Returns:
+        FastAPI application configured for UI serving
+    """
+    app = FastAPI(
+        title="Pixell Agent UI",
+        description="UI server for agent package",
+        version="0.1.0"
+    )
+    
+    # Add CORS middleware
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    # Setup UI routes
+    setup_ui_routes(app, package)
+    
+    # Add health endpoint
+    @app.get("/health")
+    async def health():
+        """UI server health check."""
+        return {"ok": True, "service": "ui", "port": port}
+    
+    return app
+
+
+def validate_ui_assets(package: AgentPackage) -> bool:
+    """Validate that UI assets exist and are properly configured.
+    
+    Args:
+        package: Agent package to validate
+        
+    Returns:
+        True if UI assets are valid, False otherwise
+    """
+    if not package.manifest.ui or not package.manifest.ui.path:
+        return False
+    
+    ui_path = Path(package.path) / package.manifest.ui.path
+    index_file = ui_path / "index.html"
+    
+    if not ui_path.exists():
+        logger.error("UI path does not exist", ui_path=str(ui_path))
+        return False
+    
+    if not index_file.exists():
+        logger.error("UI index.html not found", index_file=str(index_file))
+        return False
+    
+    logger.info("UI assets validated successfully", ui_path=str(ui_path))
+    return True

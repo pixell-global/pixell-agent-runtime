@@ -1,6 +1,7 @@
 """Main entry point for Pixell Runtime."""
 
 import asyncio
+import os
 import signal
 import sys
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ from pixell_runtime.api.middleware import (
 )
 from pixell_runtime.core.config import Settings
 from pixell_runtime.utils.logging import setup_logging
+from pixell_runtime.three_surface.runtime import ThreeSurfaceRuntime
 
 logger = structlog.get_logger()
 
@@ -83,6 +85,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 def run():
     """Run the application."""
+    # Check if we should run in three-surface mode
+    package_path = os.getenv("AGENT_PACKAGE_PATH")
+    if package_path:
+        logger.info("Running in three-surface mode", package_path=package_path)
+        runtime = ThreeSurfaceRuntime(package_path)
+        asyncio.run(runtime.start())
+        return
+    
+    # Default multi-agent runtime mode
     settings = Settings()
     
     # Handle graceful shutdown

@@ -12,3 +12,8 @@ python-multipart==0.0.6
 structlog==24.1.0
 aiofiles==23.2.1
 cryptography==42.0.0
+
+# Multi-PAR supervisor dependencies
+psutil==5.9.8
+grpcio==1.60.0
+grpcio-tools==1.60.0
