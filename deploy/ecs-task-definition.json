@@ -1,0 +1,62 @@
+{
+  "family": "pixell-runtime",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::636212886452:role/pixell-runtime-execution-role",
+  "taskRoleArn": "arn:aws:iam::636212886452:role/pixell-runtime-task-role",
+  "containerDefinitions": [
+    {
+      "name": "pixell-runtime",
+      "image": "636212886452.dkr.ecr.us-east-2.amazonaws.com/pixell-runtime:latest",
+      "environment": [
+        {
+          "name": "PAR_HOST",
+          "value": "0.0.0.0"
+        },
+        {
+          "name": "PAR_PORT",
+          "value": "8000"
+        },
+        {
+          "name": "PAR_INTERNAL_REGISTRY_BUCKET",
+          "value": "pixell-internal-registry-636212886452"
+        },
+        {
+          "name": "PAR_EXTERNAL_REGISTRY_BUCKET",
+          "value": "pixell-external-registry-636212886452"
+        },
+        {
+          "name": "PAR_LOG_LEVEL",
+          "value": "INFO"
+        }
+      ],
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        },
+        {
+          "containerPort": 9090,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/pixell-runtime",
+          "awslogs-region": "us-east-2",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8000/runtime/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}
