@@ -51,11 +51,11 @@
         }
       },
       "healthCheck": {
-        "command": ["CMD-SHELL", "curl -f http://localhost:8000/runtime/health || exit 1"],
+        "command": ["CMD-SHELL", "python -c \"import json,sys,urllib.request; resp=urllib.request.urlopen('http://127.0.0.1:8000/runtime/health', timeout=9); sys.exit(0 if resp.getcode()==200 else 1)\" || exit 1"],
         "interval": 30,
-        "timeout": 5,
-        "retries": 3,
-        "startPeriod": 60
+        "timeout": 10,
+        "retries": 5,
+        "startPeriod": 120
       }
     }
   ]

@@ -1,0 +1,59 @@
+name: Publish PAR image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'packages/runtime/**'
+      - 'Dockerfile'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write    # if you use OIDC for AWS auth
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}   # e.g. 123456789012.dkr.ecr.us-east-2.amazonaws.com
+      PAR_IMAGE_REPO: ${{ secrets.PAR_IMAGE_REPO }} # e.g. pixell-runtime
+      PAR_IMAGE_TAG: ${{ github.sha }}              # or a semver you pass in
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+      - run: corepack enable && corepack prepare pnpm@latest --activate
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+
+      # Configure AWS creds (OIDC recommended)
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}  # or use access keys secrets instead
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.PAR_IMAGE_REPO }}:${{ env.PAR_IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Echo image
+        run: echo "Pushed $ECR_REGISTRY/$PAR_IMAGE_REPO:$PAR_IMAGE_TAG"
+
