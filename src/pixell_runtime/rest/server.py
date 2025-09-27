@@ -4,16 +4,19 @@ import time
 from typing import Any, Dict, Optional
 
 import structlog
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, APIRouter
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from pixell_runtime.core.models import AgentPackage
+from pixell_runtime.utils.basepath import get_base_path, get_ports
+import grpc
+from pixell_runtime.proto import agent_pb2, agent_pb2_grpc
 
 logger = structlog.get_logger()
 
 
-def create_rest_app(package: Optional[AgentPackage] = None) -> FastAPI:
+def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[str] = None) -> FastAPI:
     """Create FastAPI application with agent-specific routes.
     
     Args:
@@ -54,17 +57,33 @@ def create_rest_app(package: Optional[AgentPackage] = None) -> FastAPI:
         
         return response
     
-    # Mount agent-specific routes if package provides them
+    # Determine base path
+    _base_path = base_path or get_base_path()
+    # Ensure base path formatting (no trailing slash except for root)
+    if not _base_path.startswith("/"):
+        _base_path = "/" + _base_path
+    if len(_base_path) > 1 and _base_path.endswith("/"):
+        _base_path = _base_path[:-1]
+
+    # Create routers with prefixes
+    builtins_router = APIRouter(prefix=_base_path)
+    api_router = APIRouter(prefix=f"{_base_path}/api")
+
+    # Mount agent-specific routes if package provides them under {BASE_PATH}/api
     if package and package.manifest.rest and package.manifest.rest.entry:
-        mount_agent_routes(app, package)
+        mount_agent_routes(api_router, package)
     
-    # Built-in endpoints
-    setup_builtin_endpoints(app, package)
+    # Built-in endpoints under {BASE_PATH}
+    setup_builtin_endpoints(builtins_router, package)
+
+    # Include routers in app
+    app.include_router(builtins_router)
+    app.include_router(api_router)
     
     return app
 
 
-def mount_agent_routes(app: FastAPI, package: AgentPackage):
+def mount_agent_routes(app: FastAPI | APIRouter, package: AgentPackage):
     """Mount agent-specific REST routes.
     
     Args:
@@ -91,7 +110,15 @@ def mount_agent_routes(app: FastAPI, package: AgentPackage):
         module = __import__(module_path, fromlist=[function_name])
         if hasattr(module, function_name):
             mount_function = getattr(module, function_name)
-            mount_function(app)
+            # Prefer mount(app, base_path=...) if available
+            try:
+                mount_function(app)
+            except TypeError:
+                # Attempt to call with keyword if function signature supports it
+                try:
+                    mount_function(app=app)
+                except Exception:
+                    raise
             logger.info("Mounted agent REST routes", entry=rest_path)
         else:
             logger.warning("Mount function not found", function=function_name)
@@ -100,7 +127,7 @@ def mount_agent_routes(app: FastAPI, package: AgentPackage):
         logger.error("Failed to mount agent REST routes", error=str(e))
 
 
-def setup_builtin_endpoints(app: FastAPI, package: Optional[AgentPackage] = None):
+def setup_builtin_endpoints(app: FastAPI | APIRouter, package: Optional[AgentPackage] = None):
     """Setup built-in REST endpoints.
     
     Args:
@@ -111,10 +138,32 @@ def setup_builtin_endpoints(app: FastAPI, package: Optional[AgentPackage] = None
     @app.get("/health")
     async def health_check():
         """Health check endpoint."""
+        # Determine gRPC health by calling AgentService.Health if configured
+        a2a_ok = False
+        if package and package.manifest.a2a:
+            try:
+                _, a2a_port, _ = get_ports()
+                with grpc.insecure_channel(f"localhost:{a2a_port}") as channel:
+                    stub = agent_pb2_grpc.AgentServiceStub(channel)
+                    stub.Health(agent_pb2.Empty())
+                a2a_ok = True
+            except Exception:
+                a2a_ok = False
+        
+        # Determine UI presence by checking assets
+        ui_ok = False
+        if package and package.manifest.ui and package.manifest.ui.path:
+            try:
+                from pathlib import Path
+                ui_path = Path(package.path) / package.manifest.ui.path
+                ui_ok = (ui_path / "index.html").exists()
+            except Exception:
+                ui_ok = False
+
         surfaces = {
             "rest": True,
-            "a2a": package.manifest.a2a is not None if package else False,
-            "ui": package.manifest.ui is not None if package else False
+            "a2a": a2a_ok,
+            "ui": ui_ok
         }
         
         return {
@@ -147,10 +196,14 @@ def setup_builtin_endpoints(app: FastAPI, package: Optional[AgentPackage] = None
         """A2A health check endpoint (HTTP shim for gRPC)."""
         if not package or not package.manifest.a2a:
             raise HTTPException(status_code=404, detail="A2A service not available")
-        
-        # TODO: Implement actual gRPC health check
-        # For now, just return OK if A2A is configured
-        return {"ok": True, "service": "a2a", "timestamp": int(time.time() * 1000)}
+        try:
+            _, a2a_port, _ = get_ports()
+            with grpc.insecure_channel(f"localhost:{a2a_port}") as channel:
+                stub = agent_pb2_grpc.AgentServiceStub(channel)
+                stub.Health(agent_pb2.Empty())
+            return {"ok": True, "service": "a2a", "timestamp": int(time.time() * 1000)}
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"gRPC health failed: {e}")
     
     @app.get("/ui/health")
     async def ui_health_check():

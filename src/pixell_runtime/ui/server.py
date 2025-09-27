@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from pixell_runtime.core.models import AgentPackage
+from pixell_runtime.utils.basepath import get_base_path
 
 logger = structlog.get_logger()
 
@@ -26,7 +27,15 @@ def setup_ui_routes(app: FastAPI, package: AgentPackage):
         return
     
     ui_path = Path(package.path) / package.manifest.ui.path
-    base_path = package.manifest.ui.basePath or "/"
+    # Compose base path from environment BASE_PATH and manifest.ui.basePath
+    env_base = get_base_path()
+    manifest_base = (package.manifest.ui.basePath or "/").strip()
+    if manifest_base == "/":
+        base_path = env_base
+    else:
+        if manifest_base.startswith("/"):
+            manifest_base = manifest_base[1:]
+        base_path = env_base + "/" + manifest_base if env_base != "/" else "/" + manifest_base
     
     if not ui_path.exists():
         logger.error("UI path does not exist", ui_path=str(ui_path))
@@ -75,6 +84,12 @@ def setup_ui_routes(app: FastAPI, package: AgentPackage):
             return FileResponse(str(index_file))
         
         raise HTTPException(status_code=404, detail="UI index.html not found")
+
+    # Provide runtime configuration for the UI to discover API base
+    @app.get(f"{base_path}ui-config.json")
+    async def ui_config():
+        api_base = base_path[:-1] + "/api" if base_path != "/" else "/api"
+        return {"apiBase": api_base}
 
 
 def create_ui_app(package: AgentPackage, port: int = 3000) -> FastAPI:

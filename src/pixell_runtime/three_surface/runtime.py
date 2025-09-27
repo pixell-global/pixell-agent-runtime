@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from pixell_runtime.agents.loader import PackageLoader
 from pixell_runtime.a2a.server import create_grpc_server, start_grpc_server
 from pixell_runtime.rest.server import create_rest_app
+from pixell_runtime.utils.basepath import get_base_path
 from pixell_runtime.ui.server import setup_ui_routes, validate_ui_assets
 from pixell_runtime.core.models import AgentPackage
 from pixell_runtime.utils.logging import setup_logging
@@ -44,6 +45,7 @@ class ThreeSurfaceRuntime:
         self.a2a_port = int(os.getenv("A2A_PORT", "50051"))
         self.ui_port = int(os.getenv("UI_PORT", "3000"))
         self.multiplexed = os.getenv("MULTIPLEXED", "true").lower() == "true"
+        self.base_path = get_base_path()
         
         # Setup logging
         setup_logging("INFO", "json")
@@ -89,8 +91,8 @@ class ThreeSurfaceRuntime:
         
         logger.info("Starting REST server", port=self.rest_port)
         
-        # Create REST app
-        self.rest_app = create_rest_app(self.package)
+        # Create REST app with base path
+        self.rest_app = create_rest_app(self.package, base_path=self.base_path)
         
         # Setup UI routes if multiplexed
         if self.multiplexed and self.package.manifest.ui:
