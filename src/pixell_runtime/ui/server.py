@@ -58,38 +58,38 @@ def setup_ui_routes(app: FastAPI, package: AgentPackage):
             name="ui_static"
         )
     
-    # Serve index.html for all routes under base_path
-    @app.get(f"{base_path}{{path:path}}")
-    async def serve_ui(path: str, request: Request):
-        """Serve UI files with SPA routing support."""
-        # If it's a file request (has extension), serve the actual file
-        if "." in path and not path.endswith("/"):
-            file_path = ui_path / path
-            if file_path.exists() and file_path.is_file():
-                return FileResponse(str(file_path))
-        
-        # For SPA routing, serve index.html for all other requests
-        index_file = ui_path / "index.html"
-        if index_file.exists():
-            return FileResponse(str(index_file))
-        
-        raise HTTPException(status_code=404, detail="UI not found")
-    
-    # Serve index.html at the base path
-    @app.get(base_path)
-    async def serve_index():
-        """Serve the main index.html file."""
-        index_file = ui_path / "index.html"
-        if index_file.exists():
-            return FileResponse(str(index_file))
-        
-        raise HTTPException(status_code=404, detail="UI index.html not found")
-
     # Provide runtime configuration for the UI to discover API base
     @app.get(f"{base_path}ui-config.json")
     async def ui_config():
         api_base = base_path[:-1] + "/api" if base_path != "/" else "/api"
         return {"apiBase": api_base}
+
+    # Lightweight UI health endpoint always available
+    @app.get(f"{base_path}ui/health")
+    async def ui_health():
+        index_file = ui_path / "index.html"
+        return {"ok": index_file.exists(), "service": "ui"}
+
+    # Serve UI with SPA fallback while not shadowing API/health endpoints
+    @app.get(f"{base_path}{{path:path}}")
+    async def serve_ui(path: str, request: Request):
+        # Do not intercept API, A2A, health, metadata, or config endpoints
+        reserved = {"health", "meta", "ui-config.json"}
+        if path.startswith("api/") or path.startswith("a2a/") or path in reserved:
+            raise HTTPException(status_code=404)
+
+        # If it's a file request (has extension), serve the actual file
+        if "." in path and not path.endswith("/"):
+            file_path = ui_path / path
+            if file_path.exists() and file_path.is_file():
+                return FileResponse(str(file_path))
+
+        # For SPA routing, serve index.html for all other requests
+        index_file = ui_path / "index.html"
+        if index_file.exists():
+            return FileResponse(str(index_file))
+
+        raise HTTPException(status_code=404, detail="UI not found")
 
 
 def create_ui_app(package: AgentPackage, port: int = 3000) -> FastAPI:

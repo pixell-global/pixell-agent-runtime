@@ -176,9 +176,4 @@ async def start_grpc_server(server: grpc.aio.Server):
     """Start the gRPC server."""
     logger.info("Starting A2A gRPC server")
     await server.start()
-    
-    try:
-        await server.wait_for_termination()
-    except KeyboardInterrupt:
-        logger.info("Shutting down A2A gRPC server")
-        await server.stop(grace=5.0)
+    # Do not block the event loop here; let runtime shutdown handle server.stop()

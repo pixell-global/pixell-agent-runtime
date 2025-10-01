@@ -65,20 +65,74 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
     if len(_base_path) > 1 and _base_path.endswith("/"):
         _base_path = _base_path[:-1]
 
-    # Create routers with prefixes
-    builtins_router = APIRouter(prefix=_base_path)
-    api_router = APIRouter(prefix=f"{_base_path}/api")
+    # Create routers (apply prefix at include time for correctness)
+    _prefix = "" if _base_path == "/" else _base_path
+    builtins_router = APIRouter()
+    # Mount agent routes at {BASE_PATH}; agent packages should prefix their routes with /api
+    agent_router = APIRouter()
 
     # Mount agent-specific routes if package provides them under {BASE_PATH}/api
     if package and package.manifest.rest and package.manifest.rest.entry:
-        mount_agent_routes(api_router, package)
+        mount_agent_routes(agent_router, package)
     
     # Built-in endpoints under {BASE_PATH}
     setup_builtin_endpoints(builtins_router, package)
 
-    # Include routers in app
-    app.include_router(builtins_router)
-    app.include_router(api_router)
+    # Include routers in app with base prefix
+    app.include_router(builtins_router, prefix=_prefix)
+    app.include_router(agent_router, prefix=_prefix)
+    # Also include agent routes at root to ensure availability regardless of base path
+    if _prefix:
+        app.include_router(agent_router, prefix="")
+
+    # Also expose a top-level health alias for runtime checks regardless of base path
+    @app.get("/health")
+    async def _top_health_alias():
+        # Delegate to built-in health handler by calling function directly
+        # Since the route function is nested, re-run the logic inline
+        a2a_ok = False
+        if package and package.manifest.a2a:
+            try:
+                # Use actual A2A port from environment (set by deployment manager)
+                import os
+                a2a_port = int(os.getenv("A2A_PORT", "50051"))
+                with grpc.insecure_channel(f"localhost:{a2a_port}") as channel:
+                    stub = agent_pb2_grpc.AgentServiceStub(channel)
+                    stub.Health(agent_pb2.Empty(), timeout=0.5)
+                a2a_ok = True
+            except Exception:
+                a2a_ok = False
+        ui_ok = False
+        if package and package.manifest.ui and package.manifest.ui.path:
+            try:
+                from pathlib import Path
+                ui_path = Path(package.path) / package.manifest.ui.path
+                ui_ok = (ui_path / "index.html").exists()
+            except Exception:
+                ui_ok = False
+        return {"ok": True, "surfaces": {"rest": True, "a2a": a2a_ok, "ui": ui_ok}}
+
+    @app.get("/ui/health")
+    async def _top_ui_health_alias():
+        # Mirror built-in UI health behavior at root level
+        try:
+            if not package or not package.manifest.ui:
+                return {"ok": False, "service": "ui", "timestamp": int(time.time() * 1000)}
+            from pathlib import Path
+            ui_path = Path(package.path) / (package.manifest.ui.path or "")
+            index_file = ui_path / "index.html"
+            return {"ok": index_file.exists(), "service": "ui", "timestamp": int(time.time() * 1000)}
+        except Exception:
+            return {"ok": False, "service": "ui", "timestamp": int(time.time() * 1000)}
+    # Debug: log mounted routes
+    try:
+        for route in getattr(app, "routes", []):
+            try:
+                logger.info("Mounted route", path=getattr(route, "path", None))
+            except Exception:
+                pass
+    except Exception:
+        pass
     
     return app
 
@@ -145,7 +199,8 @@ def setup_builtin_endpoints(app: FastAPI | APIRouter, package: Optional[AgentPac
                 _, a2a_port, _ = get_ports()
                 with grpc.insecure_channel(f"localhost:{a2a_port}") as channel:
                     stub = agent_pb2_grpc.AgentServiceStub(channel)
-                    stub.Health(agent_pb2.Empty())
+                    # Use a short timeout so health doesn't hang if gRPC isn't ready
+                    stub.Health(agent_pb2.Empty(), timeout=0.5)
                 a2a_ok = True
             except Exception:
                 a2a_ok = False
@@ -200,7 +255,7 @@ def setup_builtin_endpoints(app: FastAPI | APIRouter, package: Optional[AgentPac
             _, a2a_port, _ = get_ports()
             with grpc.insecure_channel(f"localhost:{a2a_port}") as channel:
                 stub = agent_pb2_grpc.AgentServiceStub(channel)
-                stub.Health(agent_pb2.Empty())
+                stub.Health(agent_pb2.Empty(), timeout=0.5)
             return {"ok": True, "service": "a2a", "timestamp": int(time.time() * 1000)}
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"gRPC health failed: {e}")
@@ -208,18 +263,18 @@ def setup_builtin_endpoints(app: FastAPI | APIRouter, package: Optional[AgentPac
     @app.get("/ui/health")
     async def ui_health_check():
         """UI health check endpoint."""
-        if not package or not package.manifest.ui:
-            raise HTTPException(status_code=404, detail="UI not available")
-        
-        # Check if UI assets exist
-        from pathlib import Path
-        ui_path = Path(package.path) / package.manifest.ui.path
-        index_file = ui_path / "index.html"
-        
-        if not index_file.exists():
-            raise HTTPException(status_code=404, detail="UI index.html not found")
-        
-        return {"ok": True, "service": "ui", "timestamp": int(time.time() * 1000)}
+        try:
+            if not package or not package.manifest.ui:
+                return {"ok": False, "service": "ui", "timestamp": int(time.time() * 1000)}
+            # Check if UI assets exist
+            from pathlib import Path
+            ui_path = Path(package.path) / package.manifest.ui.path
+            index_file = ui_path / "index.html"
+            if not index_file.exists():
+                return {"ok": False, "service": "ui", "timestamp": int(time.time() * 1000)}
+            return {"ok": True, "service": "ui", "timestamp": int(time.time() * 1000)}
+        except Exception:
+            return {"ok": False, "service": "ui", "timestamp": int(time.time() * 1000)}
     
     @app.get("/")
     async def root():
