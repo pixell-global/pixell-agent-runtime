@@ -1,5 +1,6 @@
 """Configuration management for Pixell Runtime."""
 
+import os
 from typing import List, Optional
 
 from pydantic import Field, HttpUrl, validator
@@ -17,8 +18,8 @@ class Settings(BaseSettings):
     )
 
     # Server configuration
-    host: str = Field("0.0.0.0", description="Server host")
-    port: int = Field(8000, description="Server port")
+    host: str = Field(default_factory=lambda: os.getenv("HOST", "0.0.0.0"), description="Server host")
+    port: int = Field(default_factory=lambda: int(os.getenv("PORT", "8000")), description="Server port")
     workers: int = Field(1, description="Number of worker processes")
     reload: bool = Field(False, description="Enable auto-reload in development")
     
