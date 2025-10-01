@@ -268,11 +268,11 @@ class PackageLoader:
             # Create venv
             venv.create(venv_path, with_pip=True, clear=True)
 
-            # Upgrade pip to at least 22.2 to support modern flags like --allow-yanked
+            # Upgrade pip to 24.0 to support modern flags like --allow-yanked
             pip_path = venv_path / "bin" / "pip"
             logger.info("Upgrading pip in venv", venv=venv_name)
             result = subprocess.run(
-                [str(pip_path), "install", "--upgrade", "pip>=22.2"],
+                [str(pip_path), "install", "--no-cache-dir", "--upgrade", "pip==24.0"],
                 capture_output=True,
                 text=True,
                 timeout=60
