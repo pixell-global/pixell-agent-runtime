@@ -7,6 +7,12 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
+# CRITICAL: Copy PORT to port before any imports that might use Settings
+# pydantic-settings has case-sensitivity issues with environment variables
+_port_override = os.getenv("PORT")
+if _port_override:
+    os.environ["port"] = _port_override
+
 import structlog
 import uvicorn
 from fastapi import FastAPI
