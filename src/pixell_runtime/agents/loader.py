@@ -367,13 +367,24 @@ class PackageLoader:
 
             logger.info("Installing pixell-runtime in venv", venv=venv_name)
 
+            # Get CodeArtifact index URL if available (reuse from agent dependencies)
+            pip_index_url = self._get_codeartifact_pip_index()
+
+            # Build pip install command for pixell-runtime
+            par_pip_cmd = [
+                str(pip_path),
+                "install",
+                "--cache-dir", str(self.pip_cache_dir),
+            ]
+
+            # Add index URL if CodeArtifact is available
+            if pip_index_url:
+                par_pip_cmd.extend(["--index-url", pip_index_url])
+
+            par_pip_cmd.extend(["-e", str(par_source_dir)])
+
             result = subprocess.run(
-                [
-                    str(pip_path),
-                    "install",
-                    "--cache-dir", str(self.pip_cache_dir),
-                    "-e", str(par_source_dir)
-                ],
+                par_pip_cmd,
                 capture_output=True,
                 text=True,
                 timeout=120  # 2 minutes max
