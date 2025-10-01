@@ -2,7 +2,7 @@
 
 from typing import List, Optional
 
-from pydantic import AliasChoices, Field, HttpUrl, validator
+from pydantic import Field, HttpUrl, validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,8 +17,8 @@ class Settings(BaseSettings):
     )
 
     # Server configuration
-    host: str = Field(default="0.0.0.0", description="Server host", validation_alias=AliasChoices('host', 'HOST'))
-    port: int = Field(default=8000, description="Server port", validation_alias=AliasChoices('port', 'PORT'))
+    host: str = Field(default="0.0.0.0", description="Server host")
+    port: int = Field(default=8000, description="Server port")
     workers: int = Field(1, description="Number of worker processes")
     reload: bool = Field(False, description="Enable auto-reload in development")
     

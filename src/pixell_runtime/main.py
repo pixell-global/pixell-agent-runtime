@@ -153,6 +153,10 @@ def run():
         return
 
     # Default multi-agent runtime mode
+    # Override port from environment if set (pydantic-settings has case sensitivity issues)
+    port_override = os.getenv("PORT")
+    if port_override:
+        os.environ["port"] = port_override  # Set lowercase version for pydantic
     settings = Settings()
     logger.info("Settings loaded", host=settings.host, port=settings.port, port_env=os.getenv("PORT"))
     
