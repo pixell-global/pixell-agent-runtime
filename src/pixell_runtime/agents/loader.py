@@ -276,12 +276,10 @@ class PackageLoader:
                 logger.info("Installing dependencies", venv=venv_name)
 
                 # Run pip install with cache
-                # Note: --allow-yanked is used to support legacy packages that may have been yanked
                 result = subprocess.run(
                     [
                         str(pip_path),
                         "install",
-                        "--allow-yanked",
                         "--cache-dir", str(self.pip_cache_dir),
                         "-r", str(requirements_file)
                     ],
