@@ -10,8 +10,13 @@ from typing import Any, Dict
 # CRITICAL: Copy PORT to port before any imports that might use Settings
 # pydantic-settings has case-sensitivity issues with environment variables
 _port_override = os.getenv("PORT")
+print(f"[STARTUP DEBUG] PORT env var: {_port_override}", flush=True)
+print(f"[STARTUP DEBUG] port env var before: {os.getenv('port')}", flush=True)
 if _port_override:
     os.environ["port"] = _port_override
+    print(f"[STARTUP DEBUG] Set port={_port_override}", flush=True)
+else:
+    print("[STARTUP DEBUG] PORT not set, using default", flush=True)
 
 import structlog
 import uvicorn
@@ -159,12 +164,10 @@ def run():
         return
 
     # Default multi-agent runtime mode
-    # Override port from environment if set (pydantic-settings has case sensitivity issues)
-    port_override = os.getenv("PORT")
-    if port_override:
-        os.environ["port"] = port_override  # Set lowercase version for pydantic
+    print(f"[RUN DEBUG] PORT={os.getenv('PORT')}, port={os.getenv('port')}", flush=True)
     settings = Settings()
-    logger.info("Settings loaded", host=settings.host, port=settings.port, port_env=os.getenv("PORT"))
+    print(f"[RUN DEBUG] Settings: host={settings.host}, port={settings.port}", flush=True)
+    logger.info("Settings loaded", host=settings.host, port=settings.port, PORT_env=os.getenv("PORT"), port_env=os.getenv("port"))
     
     # Handle graceful shutdown
     def handle_sigterm(signum, frame):
