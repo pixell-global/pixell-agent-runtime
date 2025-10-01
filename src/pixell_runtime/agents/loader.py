@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import boto3
 import structlog
 import yaml
 
@@ -223,6 +224,48 @@ class PackageLoader:
 
         return sha256_hash.hexdigest()[:7]
 
+    def _get_codeartifact_pip_index(self) -> Optional[str]:
+        """Get CodeArtifact pip index URL with auth token.
+
+        Returns:
+            CodeArtifact pip index URL with embedded auth token, or None if not configured
+        """
+        # Check if CodeArtifact is configured via environment variables
+        aws_region = os.environ.get("AWS_REGION", "us-east-2")
+        ca_domain = os.environ.get("CODEARTIFACT_DOMAIN", "pixell")
+        ca_repo = os.environ.get("CODEARTIFACT_REPOSITORY", "pypi-store")
+        ca_domain_owner = os.environ.get("AWS_ACCOUNT_ID", "636212886452")
+
+        try:
+            # Get auth token from CodeArtifact
+            client = boto3.client("codeartifact", region_name=aws_region)
+            response = client.get_authorization_token(
+                domain=ca_domain,
+                domainOwner=ca_domain_owner,
+                durationSeconds=3600  # 1 hour
+            )
+            auth_token = response["authorizationToken"]
+
+            # Get repository endpoint
+            endpoint_response = client.get_repository_endpoint(
+                domain=ca_domain,
+                domainOwner=ca_domain_owner,
+                repository=ca_repo,
+                format="pypi"
+            )
+            repo_endpoint = endpoint_response["repositoryEndpoint"]
+
+            # Construct pip index URL with embedded token
+            # Format: https://aws:{token}@domain-owner.d.codeartifact.region.amazonaws.com/pypi/repo/simple/
+            pip_index_url = repo_endpoint.replace("https://", f"https://aws:{auth_token}@") + "simple/"
+
+            logger.info("Using CodeArtifact for pip installs", domain=ca_domain, repository=ca_repo)
+            return pip_index_url
+
+        except Exception as e:
+            logger.warning("Failed to get CodeArtifact credentials, falling back to PyPI", error=str(e))
+            return None
+
     def _ensure_venv(self, package_id: str, package_path: Path, agent_app_id: Optional[str] = None) -> Path:
         """Create or reuse virtual environment for package.
 
@@ -285,14 +328,25 @@ class PackageLoader:
             if requirements_file.exists():
                 logger.info("Installing dependencies", venv=venv_name)
 
-                # Run pip install with cache
+                # Get CodeArtifact index URL if available
+                pip_index_url = self._get_codeartifact_pip_index()
+
+                # Build pip install command
+                pip_cmd = [
+                    str(pip_path),
+                    "install",
+                    "--cache-dir", str(self.pip_cache_dir),
+                ]
+
+                # Add index URL if CodeArtifact is available
+                if pip_index_url:
+                    pip_cmd.extend(["--index-url", pip_index_url])
+
+                pip_cmd.extend(["-r", str(requirements_file)])
+
+                # Run pip install
                 result = subprocess.run(
-                    [
-                        str(pip_path),
-                        "install",
-                        "--cache-dir", str(self.pip_cache_dir),
-                        "-r", str(requirements_file)
-                    ],
+                    pip_cmd,
                     capture_output=True,
                     text=True,
                     timeout=300  # 5 minutes max
