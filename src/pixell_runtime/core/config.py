@@ -8,17 +8,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """Runtime configuration settings."""
-    
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
     )
-    
+
     # Server configuration
-    host: str = Field("0.0.0.0", description="Server host", env="HOST")
-    port: int = Field(8000, description="Server port", env="PORT")
+    host: str = Field("0.0.0.0", description="Server host")
+    port: int = Field(8000, description="Server port")
     workers: int = Field(1, description="Number of worker processes")
     reload: bool = Field(False, description="Enable auto-reload in development")
     

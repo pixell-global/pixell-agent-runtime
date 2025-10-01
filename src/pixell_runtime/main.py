@@ -151,9 +151,10 @@ def run():
         runtime = ThreeSurfaceRuntime(package_path)
         asyncio.run(runtime.start())
         return
-    
+
     # Default multi-agent runtime mode
     settings = Settings()
+    logger.info("Settings loaded", host=settings.host, port=settings.port, port_env=os.getenv("PORT"))
     
     # Handle graceful shutdown
     def handle_sigterm(signum, frame):
