@@ -268,18 +268,30 @@ class PackageLoader:
             # Create venv
             venv.create(venv_path, with_pip=True, clear=True)
 
+            # Upgrade pip to latest version to support modern flags like --allow-yanked
+            pip_path = venv_path / "bin" / "pip"
+            logger.info("Upgrading pip in venv", venv=venv_name)
+            result = subprocess.run(
+                [str(pip_path), "install", "--upgrade", "pip"],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode != 0:
+                logger.warning("Failed to upgrade pip, continuing with existing version", venv=venv_name, error=result.stderr)
+
             # Install requirements if exists
             requirements_file = package_path / "requirements.txt"
             if requirements_file.exists():
-                pip_path = venv_path / "bin" / "pip"
-
                 logger.info("Installing dependencies", venv=venv_name)
 
                 # Run pip install with cache
+                # Note: --allow-yanked is used to support legacy packages that may have been yanked
                 result = subprocess.run(
                     [
                         str(pip_path),
                         "install",
+                        "--allow-yanked",
                         "--cache-dir", str(self.pip_cache_dir),
                         "-r", str(requirements_file)
                     ],
