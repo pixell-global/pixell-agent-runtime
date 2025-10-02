@@ -30,11 +30,12 @@ class A2AClient:
         """Get gRPC channel to an agent.
 
         Strategy:
-        1. If deployment_id provided and Service Discovery available:
+        1. If deployment_id provided, check if it's a local deployment (subprocess)
+        2. If deployment_id provided and Service Discovery available:
            - Try to find specific agent by ID
-        2. If prefer_internal and Service Discovery available:
+        3. If prefer_internal and Service Discovery available:
            - Return channel to any healthy agent
-        3. Fall back to external NLB endpoint
+        4. Fall back to external NLB endpoint
 
         Args:
             deployment_id: Optional specific deployment to target
@@ -46,7 +47,23 @@ class A2AClient:
         Raises:
             RuntimeError: If no agents available
         """
-        # Try Service Discovery first (internal)
+        # Check if deployment is local (running as subprocess on this PAR instance)
+        if deployment_id:
+            try:
+                from pixell_runtime.api.deploy import get_deploy_manager
+                manager = get_deploy_manager()
+                record = manager.get(deployment_id)
+                if record and record.a2a_port:
+                    # Local deployment - connect via localhost
+                    endpoint = f"localhost:{record.a2a_port}"
+                    logger.info("Using local deployment",
+                               deployment_id=deployment_id,
+                               endpoint=endpoint)
+                    return grpc.aio.insecure_channel(endpoint)
+            except:
+                pass  # Manager not initialized, continue to service discovery
+
+        # Try Service Discovery (for agents on other PAR instances)
         if self.prefer_internal and self.sd_client:
             if deployment_id:
                 agent = self.sd_client.discover_agent_by_id(deployment_id)
