@@ -50,7 +50,7 @@ class PackageLoader:
         """Load an APKG package.
 
         Args:
-            apkg_path: Path to APKG file
+            apkg_path: Path to APKG file or extracted directory
             agent_app_id: Optional agent app ID (UUID) for venv isolation
 
         Returns:
@@ -61,11 +61,15 @@ class PackageLoader:
             PackageValidationError: If package is invalid
         """
         logger.info("Loading package", path=str(apkg_path))
-        
-        # Validate file exists
+
+        # Validate path exists
         if not apkg_path.exists():
-            raise PackageLoadError(f"Package file not found: {apkg_path}")
-        
+            raise PackageLoadError(f"Package path not found: {apkg_path}")
+
+        # If path is a directory, load from extracted package
+        if apkg_path.is_dir():
+            return self.load_from_directory(apkg_path, agent_app_id)
+
         # Calculate SHA256
         sha256 = self._calculate_sha256(apkg_path)
         
@@ -118,7 +122,77 @@ class PackageLoader:
             except Exception as e:
                 logger.error("Failed to load package", error=str(e))
                 raise PackageLoadError(f"Failed to load package: {e}")
-    
+
+    def load_from_directory(self, package_dir: Path, agent_app_id: Optional[str] = None) -> AgentPackage:
+        """Load a package from an already-extracted directory.
+
+        Args:
+            package_dir: Path to extracted package directory
+            agent_app_id: Optional agent app ID (UUID) for venv isolation
+
+        Returns:
+            Loaded package instance
+
+        Raises:
+            PackageLoadError: If package cannot be loaded
+            PackageValidationError: If package is invalid
+        """
+        logger.info("Loading package from directory", path=str(package_dir))
+
+        try:
+            # Load and validate manifest
+            manifest_path = package_dir / "agent.yaml"
+            if not manifest_path.exists():
+                raise PackageValidationError("Missing agent.yaml manifest")
+
+            with open(manifest_path) as f:
+                manifest_data = yaml.safe_load(f)
+
+            # Parse manifest with our model
+            manifest = self._parse_manifest(manifest_data)
+
+            # Extract package ID from directory name (e.g., "vivid-commenter@1.0.1")
+            package_id = package_dir.name
+
+            # Get venv path from environment variable if available (subprocess case)
+            # Otherwise find/create venv
+            venv_path_str = os.environ.get("AGENT_VENV_PATH")
+            if venv_path_str:
+                venv_path = Path(venv_path_str)
+                logger.info("Using venv from environment", venv=venv_path.name)
+            else:
+                # Find or create virtual environment
+                if agent_app_id:
+                    # Calculate requirements hash to find existing venv
+                    req_hash = self._calculate_requirements_hash(package_dir)
+                    venv_name = f"{agent_app_id}_{req_hash}"
+                    venv_path = self.venvs_dir / venv_name
+
+                    if not venv_path.exists() or not self._validate_venv(venv_path):
+                        logger.warning("Venv not found for extracted package, creating new one", venv=venv_name)
+                        venv_path = self._ensure_venv(package_id, package_dir, agent_app_id)
+                else:
+                    logger.warning("No agent_app_id or venv path provided for directory load, creating venv")
+                    venv_path = self._ensure_venv(package_id, package_dir, agent_app_id)
+
+            # Create package instance (no SHA256 since we don't have the original APKG file)
+            package = AgentPackage(
+                id=package_id,
+                manifest=manifest,
+                path=str(package_dir),
+                url=f"https://local.pixell.runtime/packages/{package_id}",
+                sha256="",  # Not available for directory loads
+                status=AgentStatus.LOADING,
+                venv_path=str(venv_path)
+            )
+
+            logger.info("Package loaded from directory", package_id=package_id, venv=venv_path.name)
+            return package
+
+        except Exception as e:
+            logger.error("Failed to load package from directory", error=str(e))
+            raise PackageLoadError(f"Failed to load package from directory: {e}")
+
     def _calculate_sha256(self, file_path: Path) -> str:
         """Calculate SHA256 hash of file."""
         sha256_hash = hashlib.sha256()

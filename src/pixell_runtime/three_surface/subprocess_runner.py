@@ -52,6 +52,7 @@ class SubprocessAgentRunner:
         env = {
             **subprocess.os.environ,
             "AGENT_PACKAGE_PATH": self.package.path,  # Triggers three-surface mode
+            "AGENT_VENV_PATH": self.package.venv_path,  # Venv path for directory loads
             "REST_PORT": str(self.rest_port),
             "A2A_PORT": str(self.a2a_port),
             "UI_PORT": str(self.ui_port),
