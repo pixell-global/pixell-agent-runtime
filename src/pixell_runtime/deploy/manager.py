@@ -171,7 +171,9 @@ class DeploymentManager:
             if cache_file.exists() and not req.forceRefresh:
                 # Phase 2: Validate SHA256 if provided
                 if req.packageSha256:
-                    cached_sha256 = self._compute_file_sha256(cache_file)
+                    # Run SHA256 in executor to avoid blocking for large files
+                    loop = asyncio.get_event_loop()
+                    cached_sha256 = await loop.run_in_executor(None, self._compute_file_sha256, cache_file)
                     if cached_sha256 != req.packageSha256:
                         logger.warning(
                             "Cache SHA256 mismatch - re-downloading",
@@ -199,7 +201,9 @@ class DeploymentManager:
                         "Force refresh requested - bypassing cache",
                         deploymentId=req.deploymentId
                     )
-                fetch_package_to_path(location, cache_file)
+                # Run download in executor to avoid blocking event loop
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, fetch_package_to_path, location, cache_file)
                 logger.info(
                     "Package downloaded",
                     deploymentId=req.deploymentId,
@@ -208,7 +212,9 @@ class DeploymentManager:
 
                 # Phase 2: Verify SHA256 after download
                 if req.packageSha256:
-                    downloaded_sha256 = self._compute_file_sha256(cache_file)
+                    # Run SHA256 in executor to avoid blocking for large files
+                    loop = asyncio.get_event_loop()
+                    downloaded_sha256 = await loop.run_in_executor(None, self._compute_file_sha256, cache_file)
                     if downloaded_sha256 != req.packageSha256:
                         rec.update_status(
                             DeploymentStatus.FAILED,
@@ -228,8 +234,15 @@ class DeploymentManager:
                     )
 
             # 2) Load package with agent_app_id for venv isolation
+            # Run in executor to avoid blocking event loop (pip installs are synchronous)
             rec.update_status(DeploymentStatus.LOADING)
-            package = self.loader.load_package(cache_file, agent_app_id=req.agentAppId)
+            loop = asyncio.get_event_loop()
+            package = await loop.run_in_executor(
+                None,
+                self.loader.load_package,
+                cache_file,
+                req.agentAppId
+            )
             proc.package = package
             rec.package_path = package.path
             rec.venv_path = package.venv_path
