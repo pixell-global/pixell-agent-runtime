@@ -11,7 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
-COPY pyproject.toml .
+COPY pyproject.toml setup.py MANIFEST.in ./
 
 RUN pip install -e .
 
