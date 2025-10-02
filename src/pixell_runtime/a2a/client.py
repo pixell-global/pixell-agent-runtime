@@ -101,6 +101,40 @@ class A2AClient:
                           deployment_id=deployment_id, error=str(e))
             return False
 
+    async def invoke(
+        self,
+        action: str,
+        context: str,
+        deployment_id: Optional[str] = None,
+        timeout: float = 30.0
+    ) -> dict:
+        """Invoke an agent action via A2A.
+
+        Args:
+            action: Action name to invoke
+            context: JSON context for the action
+            deployment_id: Optional specific deployment to target
+            timeout: Invocation timeout in seconds
+
+        Returns:
+            dict with 'response' and optionally 'error'
+
+        Raises:
+            grpc.RpcError: If invocation fails
+        """
+        from pixell_runtime.proto import agent_pb2, agent_pb2_grpc
+
+        channel = self.get_agent_channel(deployment_id=deployment_id)
+        stub = agent_pb2_grpc.AgentServiceStub(channel)
+
+        request = agent_pb2.InvokeRequest(action=action, context=context)
+        response = await stub.Invoke(request, timeout=timeout)
+
+        return {
+            "response": response.response,
+            "error": response.error if response.error else None
+        }
+
 
 # Global singleton
 _a2a_client: Optional[A2AClient] = None

@@ -146,3 +146,52 @@ async def deployment_health(deployment_id: str) -> Dict[str, Any]:
     }
 
 
+@router.post("/deployments/{deployment_id}/invoke")
+async def deployment_invoke(deployment_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Invoke an agent via A2A.
+
+    Args:
+        deployment_id: Deployment to invoke
+        payload: JSON with 'action' and 'context' fields
+
+    Returns:
+        Invocation response
+    """
+    manager = get_deploy_manager()
+    record = manager.get(deployment_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+
+    if record.status != DeploymentStatus.HEALTHY:
+        raise HTTPException(status_code=503, detail=f"Deployment not healthy: {record.status.value}")
+
+    if not record.a2a_port:
+        raise HTTPException(status_code=400, detail="Deployment does not have A2A service")
+
+    action = payload.get("action")
+    context = payload.get("context", "{}")
+
+    if not action:
+        raise HTTPException(status_code=400, detail="Missing 'action' field")
+
+    try:
+        client = get_a2a_client(prefer_internal=True)
+        result = await client.invoke(
+            action=action,
+            context=context if isinstance(context, str) else json.dumps(context),
+            deployment_id=deployment_id,
+            timeout=30.0
+        )
+        logger.info("A2A invocation completed",
+                   deployment_id=deployment_id,
+                   action=action,
+                   success=result.get("error") is None)
+        return result
+    except Exception as e:
+        logger.error("A2A invocation failed",
+                    deployment_id=deployment_id,
+                    action=action,
+                    error=str(e))
+        raise HTTPException(status_code=500, detail=f"Invocation failed: {str(e)}")
+
+
