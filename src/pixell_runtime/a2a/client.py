@@ -26,7 +26,7 @@ class A2AClient:
         self,
         deployment_id: Optional[str] = None,
         timeout: int = 30
-    ) -> grpc.Channel:
+    ) -> grpc.aio.Channel:
         """Get gRPC channel to an agent.
 
         Strategy:
@@ -41,7 +41,7 @@ class A2AClient:
             timeout: Connection timeout in seconds
 
         Returns:
-            gRPC channel
+            Async gRPC channel
 
         Raises:
             RuntimeError: If no agents available
@@ -54,7 +54,7 @@ class A2AClient:
                     endpoint = f"{agent['ipv4']}:{agent['port']}"
                     logger.info("Using Service Discovery (specific agent)",
                                deployment_id=deployment_id, endpoint=endpoint)
-                    return grpc.insecure_channel(endpoint)
+                    return grpc.aio.insecure_channel(endpoint)
 
             # Get any healthy agent
             agents = self.sd_client.discover_agents(max_results=5)
@@ -63,20 +63,20 @@ class A2AClient:
                 endpoint = f"{agent['ipv4']}:{agent['port']}"
                 logger.info("Using Service Discovery (any agent)",
                            endpoint=endpoint, instance_id=agent['instance_id'])
-                return grpc.insecure_channel(endpoint)
+                return grpc.aio.insecure_channel(endpoint)
 
         # Fall back to external endpoint (NLB)
         external_endpoint = os.getenv('A2A_EXTERNAL_ENDPOINT')
         if external_endpoint:
             logger.info("Using external A2A endpoint", endpoint=external_endpoint)
-            return grpc.insecure_channel(external_endpoint)
+            return grpc.aio.insecure_channel(external_endpoint)
 
         # Last resort: try localhost (for local development)
         a2a_port = os.getenv('A2A_PORT', '50051')
         localhost_endpoint = f"localhost:{a2a_port}"
         logger.warning("No Service Discovery or external endpoint, using localhost",
                       endpoint=localhost_endpoint)
-        return grpc.insecure_channel(localhost_endpoint)
+        return grpc.aio.insecure_channel(localhost_endpoint)
 
     async def health_check(self, deployment_id: Optional[str] = None) -> bool:
         """Check health of an agent.
