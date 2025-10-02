@@ -90,7 +90,13 @@ class SubprocessAgentRunner:
     async def _forward_logs(self, stream_name: str, stream):
         """Forward subprocess logs to PAR logger."""
         try:
-            for line in stream:
+            # Use run_in_executor to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            while True:
+                # Read line in thread pool to avoid blocking
+                line = await loop.run_in_executor(None, stream.readline)
+                if not line:  # EOF
+                    break
                 line = line.rstrip()
                 if line:
                     logger.info(
