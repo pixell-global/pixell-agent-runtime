@@ -455,7 +455,7 @@ class PackageLoader:
             if pip_index_url:
                 par_pip_cmd.extend(["--index-url", pip_index_url])
 
-            par_pip_cmd.extend(["-e", str(par_source_dir)])
+            par_pip_cmd.append(str(par_source_dir))
 
             result = subprocess.run(
                 par_pip_cmd,
