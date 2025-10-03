@@ -144,11 +144,18 @@ class A2AClient:
         channel = self.get_agent_channel(deployment_id=deployment_id)
         stub = agent_pb2_grpc.AgentServiceStub(channel)
 
-        request = agent_pb2.InvokeRequest(action=action, context=context)
+        # Build parameters dict from context
+        parameters = {"context": context}
+
+        request = agent_pb2.ActionRequest(
+            action=action,
+            parameters=parameters
+        )
         response = await stub.Invoke(request, timeout=timeout)
 
         return {
-            "response": response.response,
+            "success": response.success,
+            "response": response.result,
             "error": response.error if response.error else None
         }
 
