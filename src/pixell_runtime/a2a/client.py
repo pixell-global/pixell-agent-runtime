@@ -147,9 +147,14 @@ class A2AClient:
         # Build parameters dict from context
         parameters = {"context": context}
 
+        # Generate request ID for tracing
+        import time
+        request_id = f"req_{int(time.time() * 1000000)}"
+
         request = agent_pb2.ActionRequest(
             action=action,
-            parameters=parameters
+            parameters=parameters,
+            request_id=request_id
         )
         response = await stub.Invoke(request, timeout=timeout)
 
