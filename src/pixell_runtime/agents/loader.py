@@ -367,16 +367,10 @@ class PackageLoader:
 
         venv_path = self.venvs_dir / venv_name
 
-        # Check if venv already exists and is valid
+        # Always create fresh venv for each deployment (no caching)
         if venv_path.exists():
-            if self._validate_venv(venv_path):
-                logger.info("Reusing existing venv", venv=venv_name)
-                # Update access time for LRU
-                (venv_path / ".pixell_venv_metadata.json").touch()
-                return venv_path
-            else:
-                logger.warning("Invalid venv found, rebuilding", venv=venv_name)
-                shutil.rmtree(venv_path)
+            logger.info("Removing existing venv for fresh installation", venv=venv_name)
+            shutil.rmtree(venv_path)
 
         # Create new venv
         logger.info("Creating virtual environment", venv=venv_name, package_id=package_id)
