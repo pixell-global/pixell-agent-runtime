@@ -51,6 +51,7 @@ class SubprocessAgentRunner:
         # Set environment variables for ThreeSurfaceRuntime
         env = {
             **subprocess.os.environ,
+            **self._load_agent_env_from_apkg(),  # Load .env from APKG
             "AGENT_PACKAGE_PATH": self.package.path,  # Triggers three-surface mode
             "AGENT_VENV_PATH": self.package.venv_path,  # Venv path for directory loads
             "REST_PORT": str(self.rest_port),
@@ -86,6 +87,52 @@ class SubprocessAgentRunner:
         # Start log forwarding tasks
         asyncio.create_task(self._forward_logs("stdout", self.process.stdout))
         asyncio.create_task(self._forward_logs("stderr", self.process.stderr))
+
+    def _load_agent_env_from_apkg(self) -> dict:
+        """Load environment variables from .env file in APKG.
+
+        Returns:
+            Dict of environment variables from .env file
+        """
+        env_vars = {}
+        env_file = Path(self.package.path) / ".env"
+
+        if not env_file.exists():
+            logger.debug("No .env file in APKG", package_id=self.package.id)
+            return env_vars
+
+        try:
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip comments and empty lines
+                    if not line or line.startswith('#'):
+                        continue
+
+                    # Parse KEY=VALUE format
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+
+                        # Remove quotes if present
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        elif value.startswith("'") and value.endswith("'"):
+                            value = value[1:-1]
+
+                        env_vars[key] = value
+
+            logger.info("Loaded .env from APKG",
+                       package_id=self.package.id,
+                       var_count=len(env_vars),
+                       vars=list(env_vars.keys()))  # Log keys only, not values
+        except Exception as e:
+            logger.error("Failed to load .env from APKG",
+                        package_id=self.package.id,
+                        error=str(e))
+
+        return env_vars
 
     async def _forward_logs(self, stream_name: str, stream):
         """Forward subprocess logs to PAR logger."""
