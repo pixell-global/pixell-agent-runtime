@@ -431,6 +431,29 @@ class PackageLoader:
             # Install the agent package itself (if setup.py exists)
             setup_file = package_path / "setup.py"
             if setup_file.exists():
+                # First ensure setuptools and wheel are installed (needed for editable installs)
+                logger.info("Installing setuptools and wheel for editable install", venv=venv_name)
+                try:
+                    pip_index_url = self._get_codeartifact_pip_index()
+                    setup_cmd = [str(pip_path), "install", "setuptools", "wheel"]
+                    if pip_index_url:
+                        setup_cmd.extend(["--index-url", pip_index_url])
+
+                    result = subprocess.run(
+                        setup_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
+                    if result.returncode != 0:
+                        logger.warning("Failed to install setuptools/wheel, continuing anyway",
+                                     venv=venv_name,
+                                     error=result.stderr)
+                except subprocess.TimeoutExpired:
+                    logger.warning("setuptools/wheel installation timed out, continuing anyway",
+                                 venv=venv_name)
+
+                # Now install agent package in editable mode
                 logger.info("Installing agent package in editable mode",
                            package_path=str(package_path),
                            venv=venv_name)
