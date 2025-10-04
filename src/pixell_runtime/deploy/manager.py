@@ -165,6 +165,13 @@ class DeploymentManager:
             cache_file = self.packages_dir / f"{req.agentAppId}@{req.version}.apkg"
             location = req.package_location
 
+            # Always delete cache when forceRefresh is set (fixes stale cache issue)
+            if req.forceRefresh and cache_file.exists():
+                logger.info("Force refresh - deleting cached package",
+                           deploymentId=req.deploymentId,
+                           cache_file=str(cache_file))
+                cache_file.unlink()
+
             # Check cache and decide whether to download
             should_download = req.forceRefresh or not cache_file.exists()
 
