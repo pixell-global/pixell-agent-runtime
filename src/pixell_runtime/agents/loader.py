@@ -428,6 +428,37 @@ class PackageLoader:
             else:
                 logger.info("No requirements.txt found, empty venv created", venv=venv_name)
 
+            # Install the agent package itself (if setup.py exists)
+            setup_file = package_path / "setup.py"
+            if setup_file.exists():
+                logger.info("Installing agent package in editable mode",
+                           package_path=str(package_path),
+                           venv=venv_name)
+                try:
+                    result = subprocess.run(
+                        [str(pip_path), "install", "-e", str(package_path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=120  # 2 minutes max
+                    )
+
+                    if result.returncode != 0:
+                        logger.error("Agent package installation failed",
+                                    venv=venv_name,
+                                    stderr=result.stderr,
+                                    stdout=result.stdout)
+                        raise PackageLoadError(f"Agent package installation failed: {result.stderr}")
+
+                    logger.info("Agent package installed successfully", venv=venv_name)
+
+                except subprocess.TimeoutExpired:
+                    logger.error("Agent package installation timed out", venv=venv_name)
+                    raise PackageLoadError("Agent package installation timed out after 120s")
+            else:
+                logger.info("No setup.py found - skipping agent package installation",
+                           venv=venv_name,
+                           note="Agent may have import issues if it uses root-level packages")
+
             # Install pixell-runtime itself into the venv so subprocess can run it
             pip_path = venv_path / "bin" / "pip"
             # Go from loader.py -> agents/ -> pixell_runtime/ -> src/ -> repo root
