@@ -58,6 +58,7 @@ class SubprocessAgentRunner:
             "A2A_PORT": str(self.a2a_port),
             "UI_PORT": str(self.ui_port),
             "MULTIPLEXED": "true" if self.multiplexed else "false",
+            "PYTHONPATH": self.package.path,  # Add package root to Python path for imports
         }
 
         logger.info(
