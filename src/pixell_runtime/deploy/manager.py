@@ -116,6 +116,14 @@ class DeploymentManager:
     async def _replace_deployment(self, req: DeploymentRequest, existing: DeploymentProcess):
         """Replace an existing deployment by shutting it down and starting a new one."""
         try:
+            # Delete cached package to force fresh download on replacement
+            cache_file = self.packages_dir / f"{req.agentAppId}@{req.version}.apkg"
+            if cache_file.exists():
+                logger.info("Deleting cached package for replacement",
+                           deploymentId=req.deploymentId,
+                           cache_file=str(cache_file))
+                cache_file.unlink()
+
             # Shutdown the existing deployment
             logger.info("Shutting down existing deployment for replacement",
                        deploymentId=req.deploymentId)
