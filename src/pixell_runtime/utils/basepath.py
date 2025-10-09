@@ -3,9 +3,10 @@
 import asyncio
 import os
 import socket
+from typing import Optional, Tuple
 
 
-def normalize_base_path(raw_base_path: str | None) -> str:
+def normalize_base_path(raw_base_path: Optional[str]) -> str:
     """Normalize BASE_PATH.
     - Ensure it begins with '/'
     - Remove trailing slash except when it is just '/'
@@ -53,7 +54,7 @@ async def wait_for_port_free(port: int, timeout: int = 30, host: str = "127.0.0.
     return False
 
 
-def get_ports(prefer_fixed: bool = True) -> tuple[int, int, int]:
+def get_ports(prefer_fixed: bool = True) -> Tuple[int, int, int]:
     """Return (rest_port, a2a_port, ui_port) with conflict detection.
 
     Args:

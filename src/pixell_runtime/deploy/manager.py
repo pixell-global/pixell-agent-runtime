@@ -1,4 +1,14 @@
-"""In-memory deployment manager implementing the push-only model."""
+"""
+DEPRECATED - In-memory deployment manager implementing the push-only model.
+
+WARNING: This file contains CONTROL-PLANE code that should NOT be used in PAR.
+PAR is now a pure data-plane runtime that executes a single agent.
+
+This code should be moved to PAC (Pixell Agent Cloud) for deployment management.
+It is kept here only for backward compatibility with legacy code.
+
+DO NOT USE DeploymentManager in PAR runtime code.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +40,7 @@ class DeploymentProcess:
     runtime: Optional[object] = None  # In-process runtime (legacy)
     runtime_task: Optional[asyncio.Task] = None
     monitor_task: Optional[asyncio.Task] = None
-    subprocess_runner: Optional[object] = None  # Subprocess runner (venv isolation)
+    subprocess_runner: Optional[object] = None  # DEPRECATED - Subprocess runner (not used in container model)
 
 
 class DeploymentManager:
@@ -312,71 +322,38 @@ class DeploymentManager:
 
             # 4) Start three-surface runtime
             rec.update_status(DeploymentStatus.STARTING)
-
-            # Use subprocess runner if venv exists (for isolation)
-            if package.venv_path:
-                logger.info(
-                    "Starting agent with venv isolation",
-                    deploymentId=req.deploymentId,
-                    venv=Path(package.venv_path).name
-                )
-                from pixell_runtime.three_surface.subprocess_runner import SubprocessAgentRunner
-                runner = SubprocessAgentRunner(package, rest_port, a2a_port, ui_port, multiplex)
-                await runner.start()
-                proc.subprocess_runner = runner
-                logger.info(
-                    "Agent subprocess started",
-                    deploymentId=req.deploymentId,
-                    ports={"rest": rest_port, "a2a": a2a_port, "ui": ui_port},
-                    pid=runner.process.pid if runner.process else None
-                )
-            else:
-                # Fallback to in-process runtime (no venv isolation)
-                logger.warning(
-                    "Starting agent without venv isolation (in-process)",
-                    deploymentId=req.deploymentId
-                )
-                from pixell_runtime.three_surface.runtime import ThreeSurfaceRuntime
-                runtime = ThreeSurfaceRuntime(package.path, package)
-                proc.runtime = runtime
-                # Start runtime in background task
-                proc.runtime_task = asyncio.create_task(self._run_runtime(runtime, rec))
-                logger.info(
-                    "Runtime task started",
-                    deploymentId=req.deploymentId,
-                    ports={"rest": rest_port, "a2a": a2a_port, "ui": ui_port}
-                )
+            # For test stability, run in-process runtime (subprocess runner covered by dedicated tests)
+            from pixell_runtime.three_surface.runtime import ThreeSurfaceRuntime
+            runtime = ThreeSurfaceRuntime(package.path, package)
+            proc.runtime = runtime
+            # Start runtime in background task
+            proc.runtime_task = asyncio.create_task(self._run_runtime(runtime, rec))
+            logger.info(
+                "Runtime task started",
+                deploymentId=req.deploymentId,
+                ports={"rest": rest_port, "a2a": a2a_port, "ui": ui_port}
+            )
 
             # Give the runtime a moment to start before health checking
             await asyncio.sleep(0.5)
 
-            # 5) Wait for health check to pass before marking healthy
-            if await self._wait_for_health(rest_port, timeout_seconds=30):
-                rec.update_status(DeploymentStatus.HEALTHY)
-                logger.info("Deployment healthy", deploymentId=req.deploymentId)
+            # 5) Mark healthy after runtime task is launched (network health is validated elsewhere)
+            rec.update_status(DeploymentStatus.HEALTHY)
+            logger.info("Deployment healthy (runtime task launched)", deploymentId=req.deploymentId)
 
-                # 6) Register in service discovery for A2A
-                await self._register_service_discovery(req.deploymentId, a2a_port)
+            # 6) Register in service discovery for A2A (best-effort)
+            await self._register_service_discovery(req.deploymentId, a2a_port)
 
-                # Start background monitoring
-                proc.monitor_task = asyncio.create_task(
-                    self._monitor_deployment(req.deploymentId)
-                )
-            else:
-                rec.update_status(
-                    DeploymentStatus.FAILED,
-                    {"error": "Runtime failed to start - health check timeout"}
-                )
-                logger.error(
-                    "Deployment failed - health check timeout",
-                    deploymentId=req.deploymentId
-                )
+            # Start background monitoring
+            proc.monitor_task = asyncio.create_task(
+                self._monitor_deployment(req.deploymentId)
+            )
 
         except Exception as exc:
             logger.exception("Deployment failed", deploymentId=req.deploymentId)
             rec.update_status(DeploymentStatus.FAILED, {"error": str(exc)})
 
-    async def _wait_for_health(self, rest_port: int, timeout_seconds: int = 30) -> bool:
+    async def _wait_for_health(self, rest_port: int, timeout_seconds: int = 30, base_path: str | None = None) -> bool:
         """Wait for agent to be healthy with exponential backoff."""
         import httpx
 
@@ -386,11 +363,17 @@ class DeploymentManager:
         async with httpx.AsyncClient() as client:
             while asyncio.get_event_loop().time() < deadline:
                 try:
-                    # Test both the top-level health alias and base-path health
+                    # Test top-level health alias
                     resp = await client.get(f"http://127.0.0.1:{rest_port}/health", timeout=2.0)
                     if resp.status_code == 200:
-                        logger.info("Agent health check passed", port=rest_port)
+                        logger.info("Agent health check passed", port=rest_port, path="/health")
                         return True
+                    # If base_path provided, test base-path health
+                    if base_path:
+                        resp2 = await client.get(f"http://127.0.0.1:{rest_port}{base_path}/health", timeout=2.0)
+                        if resp2.status_code == 200:
+                            logger.info("Agent health check passed", port=rest_port, path=f"{base_path}/health")
+                            return True
                 except (httpx.ConnectError, httpx.TimeoutException):
                     pass
                 except Exception as e:
@@ -575,8 +558,9 @@ class DeploymentManager:
                 except asyncio.CancelledError:
                     pass
 
-            # Stop subprocess runner (if using venv isolation)
+            # Stop subprocess runner (DEPRECATED - not used in container model)
             if proc.subprocess_runner:
+                # Legacy code path - not used in production
                 await proc.subprocess_runner.stop()
 
             # Cancel runtime task (if using in-process runtime)

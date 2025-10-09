@@ -180,52 +180,16 @@ def create_grpc_server(package: Optional[AgentPackage] = None, port: int = 50051
     # Create server
     server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
 
-    # Try to load agent's custom gRPC service first
-    service_impl = None
-    if package and package.manifest.a2a and package.manifest.a2a.service:
-        try:
-            service_path = package.manifest.a2a.service
-            if ":" in service_path:
-                module_path, function_name = service_path.split(":", 1)
-            else:
-                module_path = service_path
-                function_name = "create_service"
-
-            # Add package path to sys.path for imports
-            package_path = Path(package.path)
-            if str(package_path) not in sys.path:
-                sys.path.insert(0, str(package_path))
-
-            # Import and instantiate the agent's gRPC service
-            module = __import__(module_path, fromlist=[function_name])
-            if hasattr(module, function_name):
-                create_fn = getattr(module, function_name)
-                service_impl = create_fn()
-                logger.info("Loaded agent's custom gRPC service", service=service_path)
-        except Exception as e:
-            import traceback
-            logger.error(
-                "Failed to load agent's custom gRPC service, using default",
-                error=str(e),
-                traceback=traceback.format_exc(),
-                service_path=package.manifest.a2a.service if package and package.manifest.a2a else None
-            )
-            service_impl = None
-
-    # If no custom service, use default implementation
-    if service_impl is None:
-        logger.warning(
-            "Using default AgentServiceImpl (mock responses)",
-            has_package=package is not None,
-            has_a2a_config=package.manifest.a2a is not None if package else False
-        )
-        service_impl = AgentServiceImpl(package, agent_a2a_port=agent_a2a_port)
+    # Always use AgentServiceImpl which can load custom handlers via create_grpc_server()
+    # This avoids requiring agent-provided class to implement the full gRPC Servicer interface.
+    service_impl = AgentServiceImpl(package, agent_a2a_port=agent_a2a_port)
 
     # Add service to server
     agent_pb2_grpc.add_AgentServiceServicer_to_server(service_impl, server)
 
     # Configure server
-    listen_addr = f'[::]:{port}'
+    # Bind on IPv4 to avoid environments without IPv6
+    listen_addr = f'0.0.0.0:{port}'
     server.add_insecure_port(listen_addr)
 
     logger.info("Created A2A gRPC server", port=port, listen_addr=listen_addr, agent_a2a_port=agent_a2a_port)

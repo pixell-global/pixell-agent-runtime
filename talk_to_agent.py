@@ -13,7 +13,7 @@ logger = structlog.get_logger()
 
 
 class AgentClient:
-    """Client for communicating with agents via PAR's A2A interface."""
+    """Client for communicating with agents via PAR's REST interface."""
 
     def __init__(self, base_url: str = "https://par.pixell.global"):
         """Initialize the agent client.
@@ -24,43 +24,43 @@ class AgentClient:
         self.base_url = base_url.rstrip('/')
         self.client = httpx.AsyncClient(timeout=30.0)
 
-    async def list_deployments(self):
-        """List all active deployments (if endpoint exists)."""
+    async def list_agents(self):
+        """List all active agents (if endpoint exists)."""
         try:
-            response = await self.client.get(f"{self.base_url}/deployments")
+            response = await self.client.get(f"{self.base_url}/agents")
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                logger.info("Deployments list endpoint not available")
+                logger.info("Agents list endpoint not available")
                 return None
             raise
 
-    async def check_health(self, deployment_id: str) -> dict:
-        """Check if a deployment is healthy.
+    async def check_health(self, agent_app_id: str) -> dict:
+        """Check if an agent is healthy.
 
         Args:
-            deployment_id: The deployment ID to check
+            agent_app_id: The agent app ID to check
 
         Returns:
             Health status dictionary
         """
         response = await self.client.get(
-            f"{self.base_url}/deployments/{deployment_id}/health"
+            f"{self.base_url}/agents/{agent_app_id}/health"
         )
         response.raise_for_status()
         return response.json()
 
     async def invoke(
         self,
-        deployment_id: str,
+        agent_app_id: str,
         action: str,
         context: dict
     ) -> dict:
         """Invoke an action on the agent.
 
         Args:
-            deployment_id: The deployment ID to invoke
+            agent_app_id: The agent app ID to invoke
             action: The action name (e.g., "comment")
             context: Context data for the action
 
@@ -73,11 +73,11 @@ class AgentClient:
         }
 
         logger.info("Invoking agent",
-                   deployment_id=deployment_id,
+                   agent_app_id=agent_app_id,
                    action=action)
 
         response = await self.client.post(
-            f"{self.base_url}/deployments/{deployment_id}/invoke",
+            f"{self.base_url}/agents/{agent_app_id}/invoke",
             json=payload
         )
         response.raise_for_status()
@@ -94,19 +94,19 @@ class AgentClient:
         await self.client.aclose()
 
 
-async def interactive_mode(client: AgentClient, deployment_id: str):
+async def interactive_mode(client: AgentClient, agent_app_id: str):
     """Run interactive mode to chat with the agent.
 
     Args:
         client: The agent client
-        deployment_id: The deployment to talk to
+        agent_app_id: The agent app ID to talk to
     """
-    print(f"\n🤖 Connected to agent: {deployment_id}")
+    print(f"\n🤖 Connected to agent: {agent_app_id}")
     print("=" * 60)
 
     # Check health
     try:
-        health = await client.check_health(deployment_id)
+        health = await client.check_health(agent_app_id)
         print(f"Status: {health.get('status')}")
         print(f"Surfaces: {health.get('surfaces')}")
         print(f"Ports: {health.get('ports')}")
@@ -162,7 +162,7 @@ async def interactive_mode(client: AgentClient, deployment_id: str):
             # Invoke agent
             print(f"\n🔄 Sending to agent...")
             result = await client.invoke(
-                deployment_id=deployment_id,
+                agent_app_id=agent_app_id,
                 action=action,
                 context=context
             )
@@ -188,7 +188,7 @@ async def interactive_mode(client: AgentClient, deployment_id: str):
 
 async def single_invocation(
     client: AgentClient,
-    deployment_id: str,
+    agent_app_id: str,
     language: str,
     code: str
 ):
@@ -196,16 +196,16 @@ async def single_invocation(
 
     Args:
         client: The agent client
-        deployment_id: The deployment to invoke
+        agent_app_id: The agent app ID to invoke
         language: Programming language
         code: Code to comment
     """
-    print(f"\n🤖 Invoking agent: {deployment_id}")
+    print(f"\n🤖 Invoking agent: {agent_app_id}")
     print(f"Language: {language}")
     print(f"Code: {code}\n")
 
     result = await client.invoke(
-        deployment_id=deployment_id,
+        agent_app_id=agent_app_id,
         action="comment",
         context={
             "code": code,
@@ -226,16 +226,16 @@ async def single_invocation(
 
 async def main():
     """Main entry point."""
-    print("🤖 Agent A2A Client")
+    print("🤖 Agent Client")
     print("=" * 60)
 
-    # Prompt for deployment ID with default
-    default_deployment_id = "5a8ed496-7f16-4cd5-a718-d45545c74b0f"
-    deployment_id = input(f"Enter deployment ID [{default_deployment_id}]: ").strip()
+    # Prompt for agent app ID with default
+    default_agent_app_id = "comment-agent"
+    agent_app_id = input(f"Enter agent app ID [{default_agent_app_id}]: ").strip()
 
-    if not deployment_id:
-        deployment_id = default_deployment_id
-        print(f"Using default: {deployment_id}")
+    if not agent_app_id:
+        agent_app_id = default_agent_app_id
+        print(f"Using default: {agent_app_id}")
 
     # Always use par.pixell.global
     base_url = "https://par.pixell.global"
@@ -244,7 +244,7 @@ async def main():
 
     try:
         # Always run interactive mode
-        await interactive_mode(client, deployment_id)
+        await interactive_mode(client, agent_app_id)
     finally:
         await client.close()
 

@@ -1,4 +1,29 @@
-"""Subprocess runner for agent runtimes with venv isolation."""
+"""
+DEPRECATED - Subprocess runner for agent runtimes with venv isolation.
+
+WARNING: This module is DEPRECATED and should NOT be used in production.
+
+In the new architecture, each agent runs in its own container/ECS task.
+PAR is the entrypoint of the container and runs the agent directly in-process.
+
+OLD MODEL (Deprecated):
+- PAR spawns agents as subprocesses
+- Each subprocess has its own venv
+- PAR manages multiple agent processes
+
+NEW MODEL (Current):
+- Each agent runs in its own container
+- PAR runs one agent per container
+- ECS/Kubernetes manages containers
+- No subprocess spawning needed
+
+This file is kept only for:
+1. Backward compatibility with legacy tests
+2. Reference for migration to PAC
+
+DO NOT USE SubprocessAgentRunner in new code.
+Use ThreeSurfaceRuntime directly instead.
+"""
 
 import asyncio
 import subprocess
@@ -13,7 +38,11 @@ logger = structlog.get_logger()
 
 
 class SubprocessAgentRunner:
-    """Runs agent runtime in subprocess with venv isolation."""
+    """
+    DEPRECATED - Runs agent runtime in subprocess with venv isolation.
+    
+    Use ThreeSurfaceRuntime directly in container model instead.
+    """
 
     def __init__(self, package: AgentPackage, rest_port: int, a2a_port: int, ui_port: int, multiplexed: bool = True):
         """Initialize subprocess runner.
@@ -37,18 +66,34 @@ class SubprocessAgentRunner:
         if not self.package.venv_path:
             raise ValueError("Package does not have venv_path - venv isolation required")
 
-        venv_python = Path(self.package.venv_path) / "bin" / "python"
-        if not venv_python.exists():
-            raise FileNotFoundError(f"Venv python not found: {venv_python}")
+        import os as _os, sys as _sys
+        # Prefer system interpreter for test speed/stability unless explicitly disabled
+        use_system = _os.getenv("PAR_USE_SYSTEM_PYTHON_FOR_SUBPROCESS", "true").lower() != "false"
+        if use_system:
+            python_exec = _sys.executable
+        else:
+            venv_python = Path(self.package.venv_path) / "bin" / "python"
+            if not venv_python.exists():
+                raise FileNotFoundError(f"Venv python not found: {venv_python}")
+            python_exec = str(venv_python)
 
-        # Build command to run agent runtime
-        # Use environment variable approach - main.py checks AGENT_PACKAGE_PATH
+        # Build command to run agent runtime with explicit args for tests
         cmd = [
-            str(venv_python),
+            str(python_exec),
             "-m", "pixell_runtime",  # Run as module
+            "--rest-port", str(self.rest_port),
+            "--a2a-port", str(self.a2a_port),
+            "--ui-port", str(self.ui_port),
         ]
 
         # Set environment variables for ThreeSurfaceRuntime
+        # Ensure repo src (pixell_runtime) is importable in the venv Python without installing
+        from pathlib import Path as _Path
+        repo_src_path = str(_Path(__file__).resolve().parents[2])  # .../src
+
+        existing_pp = subprocess.os.environ.get("PYTHONPATH", "")
+        combined_pp = ":".join([p for p in [self.package.path, repo_src_path, existing_pp] if p])
+
         env = {
             **subprocess.os.environ,
             **self._load_agent_env_from_apkg(),  # Load .env from APKG
@@ -58,7 +103,7 @@ class SubprocessAgentRunner:
             "A2A_PORT": str(self.a2a_port),
             "UI_PORT": str(self.ui_port),
             "MULTIPLEXED": "true" if self.multiplexed else "false",
-            "PYTHONPATH": self.package.path,  # Add package root to Python path for imports
+            "PYTHONPATH": combined_pp,
         }
 
         logger.info(

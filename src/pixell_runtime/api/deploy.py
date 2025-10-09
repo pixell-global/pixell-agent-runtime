@@ -108,9 +108,9 @@ async def deployment_health(deployment_id: str) -> Dict[str, Any]:
     elif record.status == DeploymentStatus.FAILED:
         message = record.details.get("error", "Deployment failed")
 
-    # Add A2A health check for healthy deployments
+    # Add A2A health check for healthy deployments (independent of local a2a_port)
     a2a_healthy = None
-    if healthy and record.a2a_port:
+    if healthy:
         try:
             client = get_a2a_client(prefer_internal=True)
             a2a_healthy = await client.health_check(deployment_id=deployment_id)
@@ -157,16 +157,16 @@ async def deployment_invoke(deployment_id: str, payload: Dict[str, Any]) -> Dict
     Returns:
         Invocation response
     """
-    manager = get_deploy_manager()
-    record = manager.get(deployment_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Deployment not found")
+    # Try to read local record for logging and optional guardrails, but do not require it
+    record = None
+    try:
+        manager = get_deploy_manager()
+        record = manager.get(deployment_id)
+    except RuntimeError:
+        record = None
 
-    if record.status != DeploymentStatus.HEALTHY:
+    if record and record.status != DeploymentStatus.HEALTHY:
         raise HTTPException(status_code=503, detail=f"Deployment not healthy: {record.status.value}")
-
-    if not record.a2a_port:
-        raise HTTPException(status_code=400, detail="Deployment does not have A2A service")
 
     action = payload.get("action")
     context = payload.get("context", "{}")

@@ -1,6 +1,7 @@
 """A2A gRPC client with service discovery support."""
 
 import os
+import socket
 from typing import Optional
 import grpc
 import structlog
@@ -47,21 +48,35 @@ class A2AClient:
         Raises:
             RuntimeError: If no agents available
         """
-        # Check if deployment is local (running as subprocess on this PAR instance)
+        # Helper: quick TCP reachability check
+        def _is_port_open(host: str, port: int, timeout_sec: float = 0.25) -> bool:
+            try:
+                with socket.create_connection((host, port), timeout=timeout_sec):
+                    return True
+            except Exception:
+                return False
+
+        # Prefer reachable local deployment if present on this instance
         if deployment_id:
             try:
                 from pixell_runtime.api.deploy import get_deploy_manager
                 manager = get_deploy_manager()
                 record = manager.get(deployment_id)
                 if record and record.a2a_port:
-                    # Local deployment - connect via localhost
-                    endpoint = f"localhost:{record.a2a_port}"
-                    logger.info("Using local deployment",
-                               deployment_id=deployment_id,
-                               endpoint=endpoint)
-                    return grpc.aio.insecure_channel(endpoint)
-            except:
-                pass  # Manager not initialized, continue to service discovery
+                    host = "127.0.0.1"
+                    port = int(record.a2a_port)
+                    if _is_port_open(host, port):
+                        endpoint = f"{host}:{port}"
+                        logger.info("Using local deployment (reachable)",
+                                   deployment_id=deployment_id,
+                                   endpoint=endpoint)
+                        return grpc.aio.insecure_channel(endpoint)
+                    else:
+                        logger.info("Local deployment not reachable, falling back",
+                                   deployment_id=deployment_id, port=port)
+            except Exception as e:
+                logger.debug("Local deployment check failed, falling back",
+                             deployment_id=deployment_id, error=str(e))
 
         # Try Service Discovery (for agents on other PAR instances)
         if self.prefer_internal and self.sd_client:

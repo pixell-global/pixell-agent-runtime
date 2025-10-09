@@ -1,7 +1,7 @@
 """REST API server implementation."""
 
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import structlog
 from fastapi import FastAPI, HTTPException, Request, APIRouter
@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pixell_runtime.core.models import AgentPackage
 from pixell_runtime.utils.basepath import get_base_path, get_ports
 import grpc
+import grpc.aio as grpc_aio
 from pixell_runtime.proto import agent_pb2, agent_pb2_grpc
 
 logger = structlog.get_logger()
@@ -30,6 +31,8 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
         description="Three-surface runtime for agent packages",
         version="0.1.0"
     )
+    # Runtime readiness flag (gated in /health). Default: not ready until runtime flips it.
+    app.state.runtime_ready = False
     
     # Add CORS middleware
     app.add_middleware(
@@ -76,7 +79,7 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
         mount_agent_routes(agent_router, package)
     
     # Built-in endpoints under {BASE_PATH}
-    setup_builtin_endpoints(builtins_router, package)
+    setup_builtin_endpoints(builtins_router, package, main_app=app)
 
     # Include routers in app with base prefix
     app.include_router(builtins_router, prefix=_prefix)
@@ -85,20 +88,75 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
     if _prefix:
         app.include_router(agent_router, prefix="")
 
+    # Also expose agent health check at top level regardless of base path
+    @app.get("/agents/{agent_id}/health")
+    async def _top_agent_health_alias(agent_id: str):
+        """Top-level agent health check alias."""
+        import os
+
+        current_agent_id = os.getenv("AGENT_APP_ID", "")
+
+        if not current_agent_id or current_agent_id != agent_id:
+            return JSONResponse(
+                {
+                    "error": "Agent not found",
+                    "agentId": agent_id,
+                    "loaded": False
+                },
+                status_code=404
+            )
+
+        if not package:
+            return JSONResponse(
+                {
+                    "error": "No package loaded",
+                    "agentId": agent_id,
+                    "loaded": False
+                },
+                status_code=503
+            )
+
+        if not getattr(app.state, "runtime_ready", False):
+            return JSONResponse(
+                {
+                    "agentId": agent_id,
+                    "status": "starting",
+                    "loaded": True
+                },
+                status_code=503
+            )
+
+        return {
+            "agentId": agent_id,
+            "status": "healthy",
+            "loaded": True
+        }
+
     # Also expose a top-level health alias for runtime checks regardless of base path
     @app.get("/health")
     async def _top_health_alias():
         # Delegate to built-in health handler by calling function directly
         # Since the route function is nested, re-run the logic inline
+        # Gate readiness: return 503 until startup completed
+        try:
+            if not getattr(app.state, "runtime_ready", False):
+                return JSONResponse({
+                    "ok": False,
+                    "surfaces": {"rest": False, "a2a": False, "ui": False},
+                    "timestamp": int(time.time() * 1000)
+                }, status_code=503)
+        except Exception:
+            pass
+
         a2a_ok = False
         if package and package.manifest.a2a:
             try:
-                # Use actual A2A port from environment (set by deployment manager)
+                # Use actual A2A port from environment (set by runtime/deployer)
                 import os
                 a2a_port = int(os.getenv("A2A_PORT", "50051"))
-                with grpc.insecure_channel(f"localhost:{a2a_port}") as channel:
+                async with grpc_aio.insecure_channel(f"localhost:{a2a_port}") as channel:
                     stub = agent_pb2_grpc.AgentServiceStub(channel)
-                    stub.Health(agent_pb2.Empty(), timeout=0.5)
+                    await stub.Health(agent_pb2.Empty(), timeout=0.5)
                 a2a_ok = True
             except Exception:
                 a2a_ok = False
@@ -137,7 +195,7 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
     return app
 
 
-def mount_agent_routes(app: FastAPI | APIRouter, package: AgentPackage):
+def mount_agent_routes(app: Union[FastAPI, APIRouter], package: AgentPackage):
     """Mount agent-specific REST routes.
     
     Args:
@@ -181,26 +239,89 @@ def mount_agent_routes(app: FastAPI | APIRouter, package: AgentPackage):
         logger.error("Failed to mount agent REST routes", error=str(e))
 
 
-def setup_builtin_endpoints(app: FastAPI | APIRouter, package: Optional[AgentPackage] = None):
+def setup_builtin_endpoints(router: APIRouter, package: Optional[AgentPackage] = None, main_app: Optional[FastAPI] = None):
     """Setup built-in REST endpoints.
-    
+
     Args:
-        app: FastAPI application
+        router: APIRouter to add endpoints to
         package: Optional agent package for metadata
+        main_app: Main FastAPI application for accessing app.state
     """
-    
-    @app.get("/health")
+
+    @router.get("/agents/{agent_id}/health")
+    async def agent_health_check(agent_id: str):
+        """Health check endpoint for a specific agent.
+
+        This endpoint is called by PAC to verify that a specific agent is loaded and healthy.
+        """
+        import os
+
+        # Get the agent_app_id for the currently loaded package
+        current_agent_id = os.getenv("AGENT_APP_ID", "")
+
+        # Check if the requested agent ID matches the loaded agent
+        if not current_agent_id or current_agent_id != agent_id:
+            return JSONResponse(
+                {
+                    "error": "Agent not found",
+                    "agentId": agent_id,
+                    "loaded": False
+                },
+                status_code=404
+            )
+
+        # Check if package is loaded
+        if not package:
+            return JSONResponse(
+                {
+                    "error": "No package loaded",
+                    "agentId": agent_id,
+                    "loaded": False
+                },
+                status_code=503
+            )
+
+        # Check if runtime is ready
+        if main_app and not getattr(main_app.state, "runtime_ready", False):
+            return JSONResponse(
+                {
+                    "agentId": agent_id,
+                    "status": "starting",
+                    "loaded": True
+                },
+                status_code=503
+            )
+
+        # Agent is loaded and healthy
+        return {
+            "agentId": agent_id,
+            "status": "healthy",
+            "loaded": True
+        }
+
+    @router.get("/health")
     async def health_check():
         """Health check endpoint."""
+        # Gate readiness: return 503 until startup completed
+        try:
+            if main_app and not getattr(main_app.state, "runtime_ready", False):
+                return JSONResponse({
+                    "ok": False,
+                    "surfaces": {"rest": False, "a2a": False, "ui": False},
+                    "timestamp": int(time.time() * 1000)
+                }, status_code=503)
+        except Exception:
+            pass
         # Determine gRPC health by calling AgentService.Health if configured
         a2a_ok = False
         if package and package.manifest.a2a:
             try:
-                _, a2a_port, _ = get_ports()
-                with grpc.insecure_channel(f"localhost:{a2a_port}") as channel:
+                import os
+                a2a_port = int(os.getenv("A2A_PORT", "50051"))
+                async with grpc_aio.insecure_channel(f"localhost:{a2a_port}") as channel:
                     stub = agent_pb2_grpc.AgentServiceStub(channel)
                     # Use a short timeout so health doesn't hang if gRPC isn't ready
-                    stub.Health(agent_pb2.Empty(), timeout=0.5)
+                    await stub.Health(agent_pb2.Empty(), timeout=0.5)
                 a2a_ok = True
             except Exception:
                 a2a_ok = False
@@ -227,13 +348,13 @@ def setup_builtin_endpoints(app: FastAPI | APIRouter, package: Optional[AgentPac
             "timestamp": int(time.time() * 1000)
         }
     
-    @app.get("/meta")
+    @router.get("/meta")
     async def get_metadata():
         """Get bundle metadata."""
         if not package:
             raise HTTPException(status_code=404, detail="No package loaded")
         
-        return {
+        meta = {
             "name": package.manifest.name,
             "version": package.manifest.version,
             "description": package.manifest.description,
@@ -245,22 +366,32 @@ def setup_builtin_endpoints(app: FastAPI | APIRouter, package: Optional[AgentPac
                 "ui": package.manifest.ui is not None
             }
         }
+        # Include boot metrics if available
+        try:
+            if main_app:
+                stats = getattr(main_app.state, "boot_stats", None)
+                if stats:
+                    meta["boot_stats"] = stats
+        except Exception:
+            pass
+        return meta
     
-    @app.get("/a2a/health")
+    @router.get("/a2a/health")
     async def a2a_health_check():
         """A2A health check endpoint (HTTP shim for gRPC)."""
         if not package or not package.manifest.a2a:
             raise HTTPException(status_code=404, detail="A2A service not available")
         try:
-            _, a2a_port, _ = get_ports()
-            with grpc.insecure_channel(f"localhost:{a2a_port}") as channel:
+            import os
+            a2a_port = int(os.getenv("A2A_PORT", "50051"))
+            async with grpc_aio.insecure_channel(f"localhost:{a2a_port}") as channel:
                 stub = agent_pb2_grpc.AgentServiceStub(channel)
-                stub.Health(agent_pb2.Empty(), timeout=0.5)
+                await stub.Health(agent_pb2.Empty(), timeout=0.5)
             return {"ok": True, "service": "a2a", "timestamp": int(time.time() * 1000)}
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"gRPC health failed: {e}")
     
-    @app.get("/ui/health")
+    @router.get("/ui/health")
     async def ui_health_check():
         """UI health check endpoint."""
         try:
@@ -276,7 +407,7 @@ def setup_builtin_endpoints(app: FastAPI | APIRouter, package: Optional[AgentPac
         except Exception:
             return {"ok": False, "service": "ui", "timestamp": int(time.time() * 1000)}
     
-    @app.get("/")
+    @router.get("/")
     async def root():
         """Root endpoint."""
         return {

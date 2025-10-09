@@ -12,7 +12,7 @@ setup(
     package_data={
         'pixell_runtime.proto': ['*.proto', '*_pb2.py', '*_pb2_grpc.py'],
     },
-    python_requires=">=3.11",
+    python_requires=">=3.9",
     install_requires=[
         "fastapi>=0.109.0",
         "uvicorn[standard]>=0.27.0",
