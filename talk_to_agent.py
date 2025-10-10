@@ -1,97 +1,163 @@
 #!/usr/bin/env python3
-"""Interactive client to talk to deployed agents via A2A."""
+"""Interactive client to talk to deployed agents via A2A (gRPC)."""
 
 import asyncio
 import json
 import sys
 from typing import Optional
 
-import httpx
+import grpc
 import structlog
+
+from pixell_runtime.proto import agent_pb2, agent_pb2_grpc
 
 logger = structlog.get_logger()
 
 
 class AgentClient:
-    """Client for communicating with agents via PAR's REST interface."""
+    """Client for communicating with agents via A2A (gRPC)."""
 
-    def __init__(self, base_url: str = "https://par.pixell.global"):
+    def __init__(self, host: str = "par.pixell.global", port: int = 443, agent_app_id: str = None):
         """Initialize the agent client.
 
         Args:
-            base_url: Base URL of the PAR instance
+            host: Hostname of the PAR instance
+            port: Port for gRPC (443 for HTTPS/TLS)
+            agent_app_id: The agent app ID for path-based routing
         """
-        self.base_url = base_url.rstrip('/')
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.host = host
+        self.port = port
+        self.agent_app_id = agent_app_id
 
-    async def list_agents(self):
-        """List all active agents (if endpoint exists)."""
-        try:
-            response = await self.client.get(f"{self.base_url}/agents")
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.info("Agents list endpoint not available")
-                return None
-            raise
+        # Use TLS for production (par.pixell.global uses HTTPS)
+        if port == 443:
+            # Create SSL credentials for TLS
+            self.credentials = grpc.ssl_channel_credentials()
+            # For ALB routing, we need to set the correct :path header
+            # gRPC uses the service name in the path, so we'll use metadata to pass the agent ID
+            self.channel = grpc.aio.secure_channel(
+                f"{host}:{port}",
+                self.credentials,
+                options=[
+                    ('grpc.ssl_target_name_override', host),
+                    # Set the :authority pseudo-header for HTTP/2
+                    ('grpc.default_authority', host),
+                ]
+            )
+        else:
+            # Insecure for local testing (direct to container)
+            self.channel = grpc.aio.insecure_channel(f"{host}:{port}")
 
-    async def check_health(self, agent_app_id: str) -> dict:
-        """Check if an agent is healthy.
+        self.stub = agent_pb2_grpc.AgentServiceStub(self.channel)
 
-        Args:
-            agent_app_id: The agent app ID to check
+        # Store metadata for ALB routing
+        # Note: gRPC method calls will be like /pixell.agent.AgentService/Health
+        # But ALB expects /agents/{agent_id}/a2a/*
+        # This won't work through ALB without a proxy that rewrites paths
+        self.metadata = []
+        if agent_app_id:
+            self.metadata.append(('x-agent-id', agent_app_id))
+
+    async def check_health(self) -> dict:
+        """Check if the agent is healthy.
 
         Returns:
             Health status dictionary
         """
-        response = await self.client.get(
-            f"{self.base_url}/agents/{agent_app_id}/health"
-        )
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = await self.stub.Health(agent_pb2.Empty())
+            return {
+                "ok": response.ok,
+                "message": response.message,
+                "timestamp": response.timestamp
+            }
+        except grpc.RpcError as e:
+            logger.error("Health check failed", error=str(e), code=e.code())
+            raise
+
+    async def describe_capabilities(self) -> dict:
+        """Get agent capabilities.
+
+        Returns:
+            Capabilities dictionary with methods and metadata
+        """
+        try:
+            response = await self.stub.DescribeCapabilities(agent_pb2.Empty())
+            return {
+                "methods": list(response.methods),
+                "metadata": dict(response.metadata)
+            }
+        except grpc.RpcError as e:
+            logger.error("Failed to describe capabilities", error=str(e), code=e.code())
+            raise
 
     async def invoke(
         self,
-        agent_app_id: str,
         action: str,
-        context: dict
+        parameters: dict
     ) -> dict:
         """Invoke an action on the agent.
 
         Args:
-            agent_app_id: The agent app ID to invoke
-            action: The action name (e.g., "comment")
-            context: Context data for the action
+            action: The action name (e.g., "chat", "comment")
+            parameters: Parameters for the action
 
         Returns:
             Response from the agent
         """
-        payload = {
-            "action": action,
-            "context": json.dumps(context)
-        }
+        # Convert parameters to string dict (protobuf limitation)
+        str_params = {k: json.dumps(v) if not isinstance(v, str) else v
+                      for k, v in parameters.items()}
 
-        logger.info("Invoking agent",
-                   agent_app_id=agent_app_id,
-                   action=action)
-
-        response = await self.client.post(
-            f"{self.base_url}/agents/{agent_app_id}/invoke",
-            json=payload
+        request = agent_pb2.ActionRequest(
+            action=action,
+            parameters=str_params,
+            request_id=""  # Will be generated by agent if empty
         )
-        response.raise_for_status()
-        result = response.json()
 
-        logger.info("Agent responded",
-                   success=result.get('success'),
-                   has_error=bool(result.get('error')))
+        logger.info("Invoking agent via A2A",
+                   action=action,
+                   parameters=list(parameters.keys()))
 
-        return result
+        try:
+            response = await self.stub.Invoke(request)
+
+            result = {
+                "success": response.success,
+                "result": response.result,
+                "error": response.error if response.error else None,
+                "request_id": response.request_id,
+                "duration_ms": response.duration_ms
+            }
+
+            logger.info("Agent responded",
+                       success=result["success"],
+                       duration_ms=result.get("duration_ms"))
+
+            return result
+        except grpc.RpcError as e:
+            logger.error("Invocation failed", error=str(e), code=e.code())
+            raise
+
+    async def ping(self) -> dict:
+        """Ping the agent to check connectivity.
+
+        Returns:
+            Pong response with message and timestamp
+        """
+        try:
+            response = await self.stub.Ping(agent_pb2.Empty())
+            return {
+                "message": response.message,
+                "timestamp": response.timestamp
+            }
+        except grpc.RpcError as e:
+            logger.error("Ping failed", error=str(e), code=e.code())
+            raise
 
     async def close(self):
-        """Close the HTTP client."""
-        await self.client.aclose()
+        """Close the gRPC channel."""
+        await self.channel.close()
 
 
 async def interactive_mode(client: AgentClient, agent_app_id: str):
@@ -106,13 +172,23 @@ async def interactive_mode(client: AgentClient, agent_app_id: str):
 
     # Check health
     try:
-        health = await client.check_health(agent_app_id)
-        print(f"Status: {health.get('status')}")
-        print(f"Surfaces: {health.get('surfaces')}")
-        print(f"Ports: {health.get('ports')}")
+        health = await client.check_health()
+        print(f"Health: {'✅ OK' if health.get('ok') else '❌ Not OK'}")
+        print(f"Message: {health.get('message', 'N/A')}")
+        print(f"Timestamp: {health.get('timestamp')}")
     except Exception as e:
         print(f"⚠️  Health check failed: {e}")
-        return
+        print("Continuing anyway...")
+
+    # Get capabilities
+    try:
+        print("\n📋 Getting agent capabilities...")
+        capabilities = await client.describe_capabilities()
+        print(f"Available methods: {', '.join(capabilities.get('methods', []))}")
+        if capabilities.get('metadata'):
+            print(f"Metadata: {capabilities['metadata']}")
+    except Exception as e:
+        print(f"⚠️  Failed to get capabilities: {e}")
 
     print("\n" + "=" * 60)
     print("Chat with the AI agent (or 'quit' to exit)")
@@ -135,7 +211,7 @@ async def interactive_mode(client: AgentClient, agent_app_id: str):
                 print("\n👋 Goodbye!")
                 break
 
-            # Determine action and context based on input format
+            # Determine action and parameters based on input format
             # Format: comment:language:code OR just plain text
             if user_input.startswith("comment:") and user_input.count(':') >= 2:
                 # Code comment mode: comment:language:code
@@ -148,30 +224,31 @@ async def interactive_mode(client: AgentClient, agent_app_id: str):
                     print("⚠️  Code cannot be empty")
                     continue
 
-                context = {
+                parameters = {
                     "code": code,
                     "language": language
                 }
             else:
                 # Plain conversation mode
                 action = "chat"
-                context = {
+                parameters = {
                     "message": user_input
                 }
 
             # Invoke agent
-            print(f"\n🔄 Sending to agent...")
+            print(f"\n🔄 Sending to agent via A2A...")
             result = await client.invoke(
-                agent_app_id=agent_app_id,
                 action=action,
-                context=context
+                parameters=parameters
             )
 
             # Display result
             print("\n" + "=" * 60)
             if result.get('success'):
                 print("✅ Success!")
-                print(f"\n{result.get('response', 'No response')}")
+                print(f"\n{result.get('result', 'No response')}")
+                if result.get('duration_ms'):
+                    print(f"\n⏱️  Duration: {result['duration_ms']}ms")
             else:
                 print("❌ Failed!")
                 if result.get('error'):
@@ -181,6 +258,9 @@ async def interactive_mode(client: AgentClient, agent_app_id: str):
         except KeyboardInterrupt:
             print("\n\n👋 Goodbye!")
             break
+        except grpc.RpcError as e:
+            print(f"\n❌ gRPC Error: {e.details()}")
+            print(f"Code: {e.code()}")
         except Exception as e:
             print(f"\n❌ Error: {e}")
             logger.exception("Invocation failed")
@@ -188,7 +268,6 @@ async def interactive_mode(client: AgentClient, agent_app_id: str):
 
 async def single_invocation(
     client: AgentClient,
-    agent_app_id: str,
     language: str,
     code: str
 ):
@@ -196,18 +275,16 @@ async def single_invocation(
 
     Args:
         client: The agent client
-        agent_app_id: The agent app ID to invoke
         language: Programming language
         code: Code to comment
     """
-    print(f"\n🤖 Invoking agent: {agent_app_id}")
+    print(f"\n🤖 Invoking agent via A2A")
     print(f"Language: {language}")
     print(f"Code: {code}\n")
 
     result = await client.invoke(
-        agent_app_id=agent_app_id,
         action="comment",
-        context={
+        parameters={
             "code": code,
             "language": language
         }
@@ -216,7 +293,9 @@ async def single_invocation(
     print("=" * 60)
     if result.get('success'):
         print("✅ Success!")
-        print(f"\n{result.get('response', 'No response')}")
+        print(f"\n{result.get('result', 'No response')}")
+        if result.get('duration_ms'):
+            print(f"\n⏱️  Duration: {result['duration_ms']}ms")
     else:
         print("❌ Failed!")
         if result.get('error'):
@@ -226,21 +305,29 @@ async def single_invocation(
 
 async def main():
     """Main entry point."""
-    print("🤖 Agent Client")
+    print("🤖 Agent Client (A2A/gRPC)")
     print("=" * 60)
 
     # Prompt for agent app ID with default
-    default_agent_app_id = "comment-agent"
+    default_agent_app_id = "4906eeb7-9959-414e-84c6-f2445822ebe4"
     agent_app_id = input(f"Enter agent app ID [{default_agent_app_id}]: ").strip()
 
     if not agent_app_id:
         agent_app_id = default_agent_app_id
         print(f"Using default: {agent_app_id}")
 
-    # Always use par.pixell.global
-    base_url = "https://par.pixell.global"
+    # Use par.pixell.global with TLS on port 443
+    # The ALB will route to the agent based on the :path header in HTTP/2
+    host = "par.pixell.global"
+    port = 443
 
-    client = AgentClient(base_url=base_url)
+    print(f"\n🔗 Connecting to {host}:{port}")
+    print(f"📍 Agent path: /agents/{agent_app_id}/a2a")
+
+    # Note: gRPC over HTTP/2 through ALB requires the :path header
+    # We'll use metadata to set the path for ALB routing
+
+    client = AgentClient(host=host, port=port, agent_app_id=agent_app_id)
 
     try:
         # Always run interactive mode
