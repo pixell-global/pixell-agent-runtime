@@ -2,34 +2,47 @@
   "family": "pixell-runtime",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
-  "cpu": "512",
-  "memory": "1024",
+  "cpu": "2048",
+  "memory": "4096",
   "executionRoleArn": "arn:aws:iam::636212886452:role/pixell-runtime-execution-role",
   "taskRoleArn": "arn:aws:iam::636212886452:role/pixell-runtime-task-role",
   "containerDefinitions": [
     {
       "name": "pixell-runtime",
       "image": "636212886452.dkr.ecr.us-east-2.amazonaws.com/pixell-runtime:latest",
+      "essential": true,
       "environment": [
         {
-          "name": "PAR_HOST",
-          "value": "0.0.0.0"
+          "name": "RUNTIME_MODE",
+          "value": "multi-agent"
         },
         {
-          "name": "PAR_PORT",
+          "name": "PORT",
           "value": "8000"
         },
         {
-          "name": "PAR_INTERNAL_REGISTRY_BUCKET",
-          "value": "pixell-internal-registry-636212886452"
+          "name": "A2A_PORT",
+          "value": "50051"
         },
         {
-          "name": "PAR_EXTERNAL_REGISTRY_BUCKET",
-          "value": "pixell-external-registry-636212886452"
+          "name": "ADMIN_PORT",
+          "value": "9090"
         },
         {
-          "name": "PAR_LOG_LEVEL",
-          "value": "INFO"
+          "name": "MAX_AGENTS",
+          "value": "20"
+        },
+        {
+          "name": "SERVICE_DISCOVERY_NAMESPACE",
+          "value": "pixell-runtime.local"
+        },
+        {
+          "name": "SERVICE_DISCOVERY_SERVICE",
+          "value": "agents"
+        },
+        {
+          "name": "RUNTIME_INSTANCE_ID",
+          "value": "par-prod"
         }
       ],
       "portMappings": [
@@ -40,22 +53,30 @@
         {
           "containerPort": 9090,
           "protocol": "tcp"
+        },
+        {
+          "containerPort": 50051,
+          "protocol": "tcp"
         }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
           "awslogs-group": "/ecs/pixell-runtime",
+          "awslogs-create-group": "true",
           "awslogs-region": "us-east-2",
-          "awslogs-stream-prefix": "ecs"
+          "awslogs-stream-prefix": "par"
         }
       },
       "healthCheck": {
-        "command": ["CMD-SHELL", "curl -f http://localhost:8000/runtime/health || exit 1"],
+        "command": [
+          "CMD-SHELL",
+          "python -c \"import json,sys,urllib.request; resp=urllib.request.urlopen('http://127.0.0.1:8000/runtime/health', timeout=9); sys.exit(0 if resp.getcode()==200 else 1)\" || exit 1"
+        ],
         "interval": 30,
-        "timeout": 5,
-        "retries": 3,
-        "startPeriod": 60
+        "timeout": 10,
+        "retries": 5,
+        "startPeriod": 120
       }
     }
   ]

@@ -1,0 +1,148 @@
+{
+  "family": "pixell-runtime-multi-agent",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "executionRoleArn": "arn:aws:iam::636212886452:role/pixell-runtime-execution-role",
+  "taskRoleArn": "arn:aws:iam::636212886452:role/pixell-runtime-task-role",
+  "proxyConfiguration": {
+    "type": "APPMESH",
+    "containerName": "envoy",
+    "properties": [
+      {"name": "IgnoredUID", "value": "1337"},
+      {"name": "ProxyIngressPort", "value": "15000"},
+      {"name": "ProxyEgressPort", "value": "15001"},
+      {"name": "AppPorts", "value": "8000,9090,50051"},
+      {"name": "EgressIgnoredIPs", "value": "169.254.170.2,169.254.169.254"}
+    ]
+  },
+  "containerDefinitions": [
+    {
+      "name": "envoy",
+      "image": "public.ecr.aws/appmesh/aws-appmesh-envoy:v1.27.0.0-prod",
+      "essential": true,
+      "user": "1337",
+      "environment": [
+        {
+          "name": "APPMESH_RESOURCE_ARN",
+          "value": "arn:aws:appmesh:us-east-2:636212886452:mesh/pixell-runtime-mesh/virtualNode/par-node"
+        },
+        {
+          "name": "ENABLE_ENVOY_XRAY_TRACING",
+          "value": "1"
+        }
+      ],
+      "portMappings": [
+        {
+          "containerPort": 50051,
+          "protocol": "tcp"
+        },
+        {
+          "containerPort": 9901,
+          "protocol": "tcp"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -s http://localhost:9901/ready | grep LIVE"
+        ],
+        "interval": 5,
+        "timeout": 2,
+        "retries": 3,
+        "startPeriod": 10
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/pixell-runtime-multi-agent",
+          "awslogs-create-group": "true",
+          "awslogs-region": "us-east-2",
+          "awslogs-stream-prefix": "envoy"
+        }
+      },
+      "ulimits": [
+        {
+          "name": "nofile",
+          "softLimit": 15000,
+          "hardLimit": 15000
+        }
+      ]
+    },
+    {
+      "name": "par",
+      "image": "636212886452.dkr.ecr.us-east-2.amazonaws.com/pixell-runtime-multi-agent:latest",
+      "essential": true,
+      "dependsOn": [
+        {
+          "containerName": "envoy",
+          "condition": "HEALTHY"
+        }
+      ],
+      "environment": [
+        {
+          "name": "RUNTIME_MODE",
+          "value": "multi-agent"
+        },
+        {
+          "name": "PORT",
+          "value": "8080"
+        },
+        {
+          "name": "A2A_PORT",
+          "value": "50052"
+        },
+        {
+          "name": "ADMIN_PORT",
+          "value": "9090"
+        },
+        {
+          "name": "MAX_AGENTS",
+          "value": "20"
+        },
+        {
+          "name": "SERVICE_DISCOVERY_NAMESPACE",
+          "value": "pixell-runtime.local"
+        },
+        {
+          "name": "SERVICE_DISCOVERY_SERVICE",
+          "value": "par"
+        },
+        {
+          "name": "RUNTIME_INSTANCE_ID",
+          "value": "par-prod"
+        }
+      ],
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        },
+        {
+          "containerPort": 9090,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/pixell-runtime-multi-agent",
+          "awslogs-create-group": "true",
+          "awslogs-region": "us-east-2",
+          "awslogs-stream-prefix": "par"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:8080/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+static_resources:
+  listeners:
+  - name: grpc_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 50051
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: grpc
+          codec_type: AUTO
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: grpc_backend
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                  grpc: {}
+                route:
+                  cluster: par_router
+                  timeout: 300s
+                  # Pass through all headers including x-deployment-id
+                  auto_host_rewrite: false
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  - name: par_router
+    type: STATIC
+    connect_timeout: 5s
+    load_assignment:
+      cluster_name: par_router
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                # Route to PAR's internal gRPC router
+                address: 127.0.0.1
+                port_value: 50052
+    # Enable HTTP/2 for gRPC
+    http2_protocol_options: {}
+    upstream_connection_options:
+      tcp_keepalive: {}
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901

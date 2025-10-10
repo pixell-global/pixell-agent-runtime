@@ -15,12 +15,18 @@ logger = structlog.get_logger()
 
 class AgentServiceImpl:
     """Default A2A service implementation."""
-    
-    def __init__(self, package: Optional[AgentPackage] = None):
-        """Initialize service with optional agent package."""
+
+    def __init__(self, package: Optional[AgentPackage] = None, agent_a2a_port: Optional[int] = None):
+        """Initialize service with optional agent package.
+
+        Args:
+            package: Agent package metadata
+            agent_a2a_port: Port where the agent's gRPC server is running (for subprocess mode)
+        """
         self.package = package
         self.custom_handlers = {}
-        
+        self.agent_a2a_port = agent_a2a_port  # Port for forwarding to agent's gRPC server
+
         # Load custom handlers if package provides them
         if package and package.manifest.a2a and package.manifest.a2a.service:
             self._load_custom_handlers()
@@ -78,34 +84,50 @@ class AgentServiceImpl:
         return capabilities
     
     async def Invoke(self, request, context):
-        """Invoke an action."""
-        from pixell_runtime.proto import agent_pb2
-        
+        """Invoke an action by forwarding to agent's gRPC server."""
+        from pixell_runtime.proto import agent_pb2, agent_pb2_grpc
+
         start_time = time.time()
         request_id = request.request_id or f"req_{int(time.time() * 1000)}"
-        
+
         try:
             # Check for custom handler first
             if request.action in self.custom_handlers:
                 result = await self.custom_handlers[request.action](request.parameters)
                 success = True
                 error = ""
-            else:
-                # Default implementation - delegate to agent exports
-                if self.package and self.package.manifest.exports:
-                    # For now, use the first export as the main handler
-                    export = self.package.manifest.exports[0]
-                    # This would need to be implemented based on the agent's handler
-                    result = f"Action '{request.action}' executed with parameters: {dict(request.parameters)}"
-                    success = True
-                    error = ""
-                else:
+            # If agent has its own gRPC server (subprocess mode), forward to it
+            elif self.agent_a2a_port:
+                try:
+                    # Connect to agent's gRPC server
+                    agent_address = f"localhost:{self.agent_a2a_port}"
+                    async with grpc.aio.insecure_channel(agent_address) as channel:
+                        stub = agent_pb2_grpc.AgentServiceStub(channel)
+
+                        # Forward the request to the agent
+                        agent_response = await stub.Invoke(request, timeout=30)
+
+                        # Return the agent's response
+                        return agent_response
+
+                except Exception as forward_error:
+                    logger.error(
+                        "Failed to forward to agent gRPC server",
+                        action=request.action,
+                        port=self.agent_a2a_port,
+                        error=str(forward_error)
+                    )
                     result = ""
                     success = False
-                    error = f"No handler found for action: {request.action}"
-            
+                    error = f"Failed to forward to agent: {str(forward_error)}"
+            else:
+                # No custom handler and no agent gRPC server
+                result = ""
+                success = False
+                error = f"No handler found for action: {request.action}"
+
             duration_ms = int((time.time() - start_time) * 1000)
-            
+
             return agent_pb2.ActionResult(
                 success=success,
                 result=str(result),
@@ -113,11 +135,11 @@ class AgentServiceImpl:
                 request_id=request_id,
                 duration_ms=duration_ms
             )
-            
+
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
             logger.error("Action invocation failed", action=request.action, error=str(e))
-            
+
             return agent_pb2.ActionResult(
                 success=False,
                 result="",
@@ -136,13 +158,14 @@ class AgentServiceImpl:
         )
 
 
-def create_grpc_server(package: Optional[AgentPackage] = None, port: int = 50051) -> grpc.aio.Server:
+def create_grpc_server(package: Optional[AgentPackage] = None, port: int = 50051, agent_a2a_port: Optional[int] = None) -> grpc.aio.Server:
     """Create and configure gRPC server.
-    
+
     Args:
         package: Optional agent package with custom handlers
         port: Port to bind the server to
-        
+        agent_a2a_port: Port where the agent's gRPC server is running (for forwarding in subprocess mode)
+
     Returns:
         Configured gRPC server
     """
@@ -153,22 +176,24 @@ def create_grpc_server(package: Optional[AgentPackage] = None, port: int = 50051
     if str(pkg_dir) not in sys.path:
         sys.path.insert(0, str(pkg_dir))
     from pixell_runtime.proto import agent_pb2_grpc
-    
+
     # Create server
     server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
-    
-    # Create service implementation
-    service_impl = AgentServiceImpl(package)
-    
+
+    # Always use AgentServiceImpl which can load custom handlers via create_grpc_server()
+    # This avoids requiring agent-provided class to implement the full gRPC Servicer interface.
+    service_impl = AgentServiceImpl(package, agent_a2a_port=agent_a2a_port)
+
     # Add service to server
     agent_pb2_grpc.add_AgentServiceServicer_to_server(service_impl, server)
-    
+
     # Configure server
-    listen_addr = f'[::]:{port}'
+    # Bind on IPv4 to avoid environments without IPv6
+    listen_addr = f'0.0.0.0:{port}'
     server.add_insecure_port(listen_addr)
-    
-    logger.info("Created A2A gRPC server", port=port, listen_addr=listen_addr)
-    
+
+    logger.info("Created A2A gRPC server", port=port, listen_addr=listen_addr, agent_a2a_port=agent_a2a_port)
+
     return server
 
 
@@ -176,9 +201,4 @@ async def start_grpc_server(server: grpc.aio.Server):
     """Start the gRPC server."""
     logger.info("Starting A2A gRPC server")
     await server.start()
-    
-    try:
-        await server.wait_for_termination()
-    except KeyboardInterrupt:
-        logger.info("Shutting down A2A gRPC server")
-        await server.stop(grace=5.0)
+    # Do not block the event loop here; let runtime shutdown handle server.stop()

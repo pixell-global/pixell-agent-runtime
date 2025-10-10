@@ -15,5 +15,6 @@ cryptography==42.0.0
 
 # Multi-PAR supervisor dependencies
 psutil==5.9.8
-grpcio==1.60.0
-grpcio-tools==1.60.0
+grpcio==1.66.1
+grpcio-tools==1.66.1
+protobuf==5.27.2

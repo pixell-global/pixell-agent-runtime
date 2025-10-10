@@ -7,6 +7,17 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
+# CRITICAL: Copy PORT to port before any imports that might use Settings
+# pydantic-settings has case-sensitivity issues with environment variables
+_port_override = os.getenv("PORT")
+print(f"[STARTUP DEBUG] PORT env var: {_port_override}", flush=True)
+print(f"[STARTUP DEBUG] port env var before: {os.getenv('port')}", flush=True)
+if _port_override:
+    os.environ["port"] = _port_override
+    print(f"[STARTUP DEBUG] Set port={_port_override}", flush=True)
+else:
+    print("[STARTUP DEBUG] PORT not set, using default", flush=True)
+
 import structlog
 import uvicorn
 from fastapi import FastAPI
@@ -14,7 +25,10 @@ from prometheus_client import make_asgi_app
 
 from pixell_runtime import __version__
 from pixell_runtime.api.health import router as health_router
+from pixell_runtime.api.health import health_check as runtime_health_check
 from pixell_runtime.api.agents import router as agents_router, init_agent_manager
+from pixell_runtime.api.deploy import router as deploy_router, init_deploy_manager
+from pixell_runtime.deploy.manager import DeploymentManager
 from pixell_runtime.api.middleware import (
     setup_error_handling,
     setup_logging_middleware,
@@ -31,21 +45,65 @@ logger = structlog.get_logger()
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     logger.info("Starting Pixell Runtime", version=__version__)
-    
+
     # Initialize components
     settings = app.state.settings
-    
-    # Initialize agent manager
+
+    # Initialize agent manager and deployment manager
     from pathlib import Path
     packages_dir = Path(settings.package_cache_dir)
     app.state.agent_manager = init_agent_manager(packages_dir)
     logger.info("Agent manager initialized", packages_dir=str(packages_dir))
-    
+
+    # Deployment manager
+    app.state.deployment_manager = init_deploy_manager(DeploymentManager(packages_dir))
+    logger.info("Deployment manager initialized")
+
+    # Start A2A router in multi-agent mode
+    app.state.a2a_router_server = None
+    runtime_mode = os.getenv("RUNTIME_MODE", "single")
+    if runtime_mode == "multi-agent":
+        try:
+            from pixell_runtime.a2a.router import create_router_server, start_router_server
+            a2a_port = int(os.getenv("A2A_PORT", "50052"))
+
+            # Check if Envoy is present (Envoy has ENVOY_ADMIN_URL set)
+            # If Envoy is present, bind to localhost only (internal routing)
+            # Otherwise, bind to 0.0.0.0 for external access
+            bind_address = "127.0.0.1" if os.getenv("ENVOY_ADMIN_URL") else "0.0.0.0"
+
+            logger.info("Starting A2A router for multi-agent mode", port=a2a_port, bind_address=bind_address)
+            app.state.a2a_router_server = create_router_server(
+                app.state.deployment_manager,
+                port=a2a_port,
+                bind_address=bind_address
+            )
+            await start_router_server(app.state.a2a_router_server)
+            logger.info("A2A router started successfully", port=a2a_port, bind_address=bind_address)
+        except Exception as e:
+            logger.exception("Failed to start A2A router", error=str(e))
+            # Don't fail startup if router fails
+    else:
+        logger.info("Skipping A2A router (not in multi-agent mode)")
+
     yield
-    
+
     # Cleanup
     logger.info("Shutting down Pixell Runtime")
-    # TODO: Graceful shutdown of components
+    try:
+        # Stop A2A router if running
+        if hasattr(app.state, "a2a_router_server") and app.state.a2a_router_server:
+            from pixell_runtime.a2a.router import stop_router_server
+            await stop_router_server(app.state.a2a_router_server)
+            logger.info("A2A router stopped")
+    except Exception:
+        logger.exception("Error stopping A2A router")
+
+    try:
+        if hasattr(app.state, "deployment_manager") and app.state.deployment_manager:
+            await app.state.deployment_manager.shutdown_all()
+    except Exception:
+        pass
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -73,7 +131,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     
     # Mount routers
     app.include_router(health_router, prefix="/runtime", tags=["runtime"])
-    app.include_router(agents_router, prefix="/runtime", tags=["agents"])
+    # Expose agent endpoints at root per external contract
+    app.include_router(agents_router, tags=["agents"])  # /agents/*
+    # Also mount under /runtime for backward compatibility
+    app.include_router(agents_router, prefix="/runtime", tags=["agents"])  # legacy paths
+    # Mount deploy endpoints both under / and /runtime for compatibility
+    app.include_router(deploy_router, tags=["deploy"])  # provides /deploy and /deployments/{id}/health
+    app.include_router(deploy_router, prefix="/runtime", tags=["deploy"])  # legacy paths
+
+    # Provide top-level runtime health alias per contract
+    @app.get("/health")
+    async def top_level_health():
+        return await runtime_health_check()
+    
     
     # Mount Prometheus metrics endpoint
     if settings.metrics_enabled:
@@ -92,9 +162,12 @@ def run():
         runtime = ThreeSurfaceRuntime(package_path)
         asyncio.run(runtime.start())
         return
-    
+
     # Default multi-agent runtime mode
+    print(f"[RUN DEBUG] PORT={os.getenv('PORT')}, port={os.getenv('port')}", flush=True)
     settings = Settings()
+    print(f"[RUN DEBUG] Settings: host={settings.host}, port={settings.port}", flush=True)
+    logger.info("Settings loaded", host=settings.host, port=settings.port, PORT_env=os.getenv("PORT"), port_env=os.getenv("port"))
     
     # Handle graceful shutdown
     def handle_sigterm(signum, frame):

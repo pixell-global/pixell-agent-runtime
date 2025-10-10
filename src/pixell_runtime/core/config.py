@@ -8,16 +8,19 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """Runtime configuration settings."""
-    
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
+        # Environment variables take precedence over .env file
+        env_prefix="",
     )
-    
+
     # Server configuration
-    host: str = Field("0.0.0.0", description="Server host")
-    port: int = Field(8000, description="Server port")
+    host: str = Field(default="0.0.0.0", description="Server host")
+    port: int = Field(default=8000, description="Server port")
     workers: int = Field(1, description="Number of worker processes")
     reload: bool = Field(False, description="Enable auto-reload in development")
     
@@ -94,7 +97,7 @@ class Settings(BaseSettings):
     max_package_size_mb: int = Field(100, env="MAX_PACKAGE_SIZE_MB")
     request_timeout_seconds: int = Field(30, env="REQUEST_TIMEOUT_SECONDS")
     max_concurrent_invocations: int = Field(500, env="MAX_CONCURRENT_INVOCATIONS")
-    
+
     @validator("packages_urls", pre=True)
     def parse_packages_urls(cls, v: Optional[str]) -> Optional[List[str]]:
         """Parse comma-separated package URLs."""
