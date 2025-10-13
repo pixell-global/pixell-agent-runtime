@@ -1,0 +1,143 @@
+{
+  "family": "pixell-agent-runtime",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/pixell-agent-runtime-execution-role",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/pixell-agent-runtime-task-role",
+  "containerDefinitions": [
+    {
+      "name": "agent-runtime",
+      "image": "ACCOUNT_ID.dkr.ecr.us-east-2.amazonaws.com/pixell-agent-runtime:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp",
+          "name": "rest-port"
+        },
+        {
+          "containerPort": 50051,
+          "protocol": "tcp",
+          "name": "a2a-port"
+        },
+        {
+          "containerPort": 3000,
+          "protocol": "tcp",
+          "name": "ui-port"
+        }
+      ],
+      "environment": [
+        {
+          "name": "AGENT_APP_ID",
+          "value": "REPLACE_WITH_AGENT_APP_ID"
+        },
+        {
+          "name": "DEPLOYMENT_ID",
+          "value": "REPLACE_WITH_DEPLOYMENT_ID"
+        },
+        {
+          "name": "PACKAGE_URL",
+          "value": "s3://pixell-agent-packages/AGENT_APP_ID/package.apkg"
+        },
+        {
+          "name": "PACKAGE_SHA256",
+          "value": "REPLACE_WITH_SHA256_CHECKSUM"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "us-east-2"
+        },
+        {
+          "name": "S3_BUCKET",
+          "value": "pixell-agent-packages"
+        },
+        {
+          "name": "REST_PORT",
+          "value": "8080"
+        },
+        {
+          "name": "A2A_PORT",
+          "value": "50051"
+        },
+        {
+          "name": "UI_PORT",
+          "value": "3000"
+        },
+        {
+          "name": "BASE_PATH",
+          "value": "/agents/AGENT_APP_ID"
+        },
+        {
+          "name": "MULTIPLEXED",
+          "value": "true"
+        },
+        {
+          "name": "MAX_PACKAGE_SIZE_MB",
+          "value": "100"
+        },
+        {
+          "name": "BOOT_BUDGET_MS",
+          "value": "5000"
+        },
+        {
+          "name": "BOOT_HARD_LIMIT_MULTIPLIER",
+          "value": "2.0"
+        },
+        {
+          "name": "GRACEFUL_SHUTDOWN_TIMEOUT_SEC",
+          "value": "30"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/pixell-agent-runtime",
+          "awslogs-region": "us-east-2",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:8080/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "stopTimeout": 35,
+      "mountPoints": [
+        {
+          "sourceVolume": "wheelhouse-cache",
+          "containerPath": "/opt/wheelhouse",
+          "readOnly": true
+        }
+      ]
+    }
+  ],
+  "volumes": [
+    {
+      "name": "wheelhouse-cache",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "REPLACE_WITH_EFS_ID",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "REPLACE_WITH_EFS_ACCESS_POINT_ID"
+        }
+      }
+    }
+  ],
+  "tags": [
+    {
+      "key": "Service",
+      "value": "PixellAgentRuntime"
+    },
+    {
+      "key": "Environment",
+      "value": "production"
+    }
+  ]
+}

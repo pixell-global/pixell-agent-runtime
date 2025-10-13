@@ -1,0 +1,48 @@
+[Unit]
+Description=Pixell Agent Runtime Supervisor
+Documentation=https://github.com/pixell-ai/pixell-agent-runtime
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/pixell-agent-runtime
+
+# Environment variables
+Environment="PYTHONUNBUFFERED=1"
+Environment="PACKAGE_CACHE_DIR=/var/lib/pixell/packages"
+Environment="PACKAGE_EXTRACT_DIR=/var/lib/pixell/extracted"
+Environment="SUPERVISOR_PORT=9000"
+Environment="SUPERVISOR_HOST=0.0.0.0"
+Environment="AWS_REGION=us-east-2"
+Environment="S3_BUCKET=pixell-agent-packages"
+Environment="MAX_AGENTS=20"
+
+# Start supervisor
+ExecStart=/usr/bin/python3 -m pixell_runtime.supervisor
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pixell-supervisor
+
+# Security settings (running as root for useradd/userdel)
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/var/lib/pixell /home /tmp
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

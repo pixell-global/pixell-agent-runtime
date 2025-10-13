@@ -415,14 +415,14 @@ resource "aws_lb_target_group" "main" {
 
   health_check {
     enabled             = true
-    healthy_threshold   = 2
-    interval            = 30
+    healthy_threshold   = 3
+    interval            = 45
     matcher             = "200"
     path                = "/runtime/health"
     port                = "traffic-port"
     protocol            = "HTTP"
-    timeout             = 5
-    unhealthy_threshold = 2
+    timeout             = 10
+    unhealthy_threshold = 3
   }
 
   tags = {
@@ -512,6 +512,17 @@ resource "aws_ecs_task_definition" "pixell_runtime" {
           "awslogs-region"        = var.aws_region
           "awslogs-stream-prefix" = "ecs"
         }
+      }
+
+      healthCheck = {
+        command     = [
+          "CMD-SHELL",
+          "python -c \"import json,sys,urllib.request; resp=urllib.request.urlopen('http://127.0.0.1:8000/runtime/health', timeout=9); sys.exit(0 if resp.getcode()==200 else 1)\" || exit 1"
+        ]
+        interval    = 30
+        timeout     = 10
+        retries     = 5
+        startPeriod = 120
       }
     }
   ])

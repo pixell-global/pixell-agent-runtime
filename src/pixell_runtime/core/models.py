@@ -80,7 +80,7 @@ class AgentManifest(BaseModel):
 
 class AgentPackage(BaseModel):
     """Represents a loaded agent package."""
-    
+
     id: str = Field(..., description="Package ID (name@version)")
     manifest: AgentManifest = Field(..., description="Package manifest")
     path: str = Field(..., description="Local filesystem path")
@@ -90,6 +90,7 @@ class AgentPackage(BaseModel):
     loaded_at: datetime = Field(default_factory=datetime.utcnow)
     status: AgentStatus = Field(AgentStatus.PENDING)
     error: Optional[str] = Field(None, description="Error message if failed")
+    venv_path: Optional[str] = Field(None, description="Virtual environment path")
 
 
 class Agent(BaseModel):

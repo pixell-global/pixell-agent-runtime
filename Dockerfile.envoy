@@ -1,0 +1,18 @@
+FROM envoyproxy/envoy:v1.29-latest
+
+# Copy envoy configuration
+COPY envoy.yaml /etc/envoy/envoy.yaml
+
+# Ensure proper permissions
+RUN chmod 644 /etc/envoy/envoy.yaml
+
+# Expose ports
+EXPOSE 50051 9901
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl -sf http://localhost:9901/ready | grep -q LIVE || exit 1
+
+# Run envoy
+ENTRYPOINT ["/usr/local/bin/envoy"]
+CMD ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]

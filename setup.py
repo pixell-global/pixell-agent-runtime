@@ -8,7 +8,11 @@ setup(
     version="0.1.0",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
-    python_requires=">=3.11",
+    include_package_data=True,
+    package_data={
+        'pixell_runtime.proto': ['*.proto', '*_pb2.py', '*_pb2_grpc.py'],
+    },
+    python_requires=">=3.9",
     install_requires=[
         "fastapi>=0.109.0",
         "uvicorn[standard]>=0.27.0",
@@ -23,6 +27,9 @@ setup(
         "structlog>=24.1.0",
         "aiofiles>=23.2.1",
         "cryptography>=42.0.0",
+        "grpcio>=1.66.1",
+        "grpcio-tools>=1.66.1",
+        "protobuf>=5.27.0",
     ],
     entry_points={
         "console_scripts": [

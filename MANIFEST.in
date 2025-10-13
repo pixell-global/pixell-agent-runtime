@@ -1,0 +1,11 @@
+# Include proto files and generated Python files
+include src/pixell_runtime/proto/*.proto
+include src/pixell_runtime/proto/*_pb2.py
+include src/pixell_runtime/proto/*_pb2_grpc.py
+
+# Include README and LICENSE
+include README.md
+include LICENSE
+
+# Include requirements
+include requirements.txt

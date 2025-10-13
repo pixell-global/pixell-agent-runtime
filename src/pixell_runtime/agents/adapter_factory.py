@@ -23,11 +23,17 @@ async def create_adapter(package: AgentPackage):
     Returns:
         An initialized adapter
     """
+    # Add package root to sys.path for root-level imports (core/, app/, etc.)
+    package_root = Path(package.path)
+    if package_root not in [Path(p) for p in sys.path]:
+        sys.path.insert(0, str(package_root))
+        logger.debug("Added package root to sys.path", path=str(package_root))
+
     # Load the main module
-    src_path = Path(package.path) / "src"
+    src_path = package_root / "src"
     if src_path.exists():
         sys.path.insert(0, str(src_path))
-        
+
     # Also add the a2a directory for protobuf imports
     a2a_path = src_path / "a2a"
     if a2a_path.exists():
