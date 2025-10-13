@@ -153,7 +153,7 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
             try:
                 # Use actual A2A port from environment (set by runtime/deployer)
                 import os
-                a2a_port = int(os.getenv("A2A_PORT", "50051"))
+                a2a_port = int(os.getenv("A2A_PORT", "50052"))
                 async with grpc_aio.insecure_channel(f"localhost:{a2a_port}") as channel:
                     stub = agent_pb2_grpc.AgentServiceStub(channel)
                     await stub.Health(agent_pb2.Empty(), timeout=0.5)
@@ -182,6 +182,22 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
             return {"ok": index_file.exists(), "service": "ui", "timestamp": int(time.time() * 1000)}
         except Exception:
             return {"ok": False, "service": "ui", "timestamp": int(time.time() * 1000)}
+
+    @app.get("/a2a/health")
+    async def _top_a2a_health_alias():
+        """Top-level A2A health check alias for ECS health checks."""
+        if not package or not package.manifest.a2a:
+            return {"ok": False, "service": "a2a", "timestamp": int(time.time() * 1000)}
+        try:
+            import os
+            a2a_port = int(os.getenv("A2A_PORT", "50052"))
+            async with grpc_aio.insecure_channel(f"localhost:{a2a_port}") as channel:
+                stub = agent_pb2_grpc.AgentServiceStub(channel)
+                await stub.Health(agent_pb2.Empty(), timeout=0.5)
+            return {"ok": True, "service": "a2a", "timestamp": int(time.time() * 1000)}
+        except Exception:
+            return {"ok": False, "service": "a2a", "timestamp": int(time.time() * 1000)}
+
     # Debug: log mounted routes
     try:
         for route in getattr(app, "routes", []):
@@ -217,7 +233,23 @@ def mount_agent_routes(app: Union[FastAPI, APIRouter], package: AgentPackage):
         package_path = Path(package.path)
         if str(package_path) not in sys.path:
             sys.path.insert(0, str(package_path))
-        
+
+        # Add venv site-packages to sys.path BEFORE importing agent modules
+        # This fixes ModuleNotFoundError for agent dependencies like sqlalchemy
+        if hasattr(package, 'venv_path') and package.venv_path:
+            venv_site_packages = (
+                Path(package.venv_path) / "lib" /
+                f"python{sys.version_info.major}.{sys.version_info.minor}" /
+                "site-packages"
+            )
+            if venv_site_packages.exists():
+                if str(venv_site_packages) not in sys.path:
+                    sys.path.insert(0, str(venv_site_packages))
+                    logger.info(
+                        "Added venv site-packages to sys.path",
+                        path=str(venv_site_packages)
+                    )
+
         # Import and mount routes
         module = __import__(module_path, fromlist=[function_name])
         if hasattr(module, function_name):
@@ -317,7 +349,7 @@ def setup_builtin_endpoints(router: APIRouter, package: Optional[AgentPackage] =
         if package and package.manifest.a2a:
             try:
                 import os
-                a2a_port = int(os.getenv("A2A_PORT", "50051"))
+                a2a_port = int(os.getenv("A2A_PORT", "50052"))
                 async with grpc_aio.insecure_channel(f"localhost:{a2a_port}") as channel:
                     stub = agent_pb2_grpc.AgentServiceStub(channel)
                     # Use a short timeout so health doesn't hang if gRPC isn't ready
@@ -383,7 +415,7 @@ def setup_builtin_endpoints(router: APIRouter, package: Optional[AgentPackage] =
             raise HTTPException(status_code=404, detail="A2A service not available")
         try:
             import os
-            a2a_port = int(os.getenv("A2A_PORT", "50051"))
+            a2a_port = int(os.getenv("A2A_PORT", "50052"))
             async with grpc_aio.insecure_channel(f"localhost:{a2a_port}") as channel:
                 stub = agent_pb2_grpc.AgentServiceStub(channel)
                 await stub.Health(agent_pb2.Empty(), timeout=0.5)

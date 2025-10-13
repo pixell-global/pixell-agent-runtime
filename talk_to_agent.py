@@ -7,11 +7,52 @@ import sys
 from typing import Optional
 
 import grpc
+import grpc.aio
 import structlog
 
 from pixell_runtime.proto import agent_pb2, agent_pb2_grpc
 
 logger = structlog.get_logger()
+
+
+class PathPrefixInterceptor(grpc.aio.UnaryUnaryClientInterceptor):
+    """Interceptor to prepend path prefix to all gRPC calls for ALB routing."""
+
+    def __init__(self, path_prefix: str):
+        """Initialize with path prefix.
+
+        Args:
+            path_prefix: Path prefix to prepend (e.g., "/agents/{agent_id}/a2a")
+        """
+        self.path_prefix = path_prefix.rstrip('/')
+
+    async def intercept_unary_unary(self, continuation, client_call_details, request):
+        """Intercept and modify the gRPC call path.
+
+        Transforms paths like:
+          /pixell.agent.AgentService/Health
+        Into:
+          /agents/{agent_id}/a2a/pixell.agent.AgentService/Health
+        """
+        # Modify the method (path) in the call details
+        # gRPC method is bytes, so decode -> concatenate -> encode
+        original_method = client_call_details.method.decode('utf-8')
+        new_method = f"{self.path_prefix}{original_method}".encode('utf-8')
+
+        # Create new call details with modified method
+        new_details = grpc.aio.ClientCallDetails(
+            method=new_method,
+            timeout=client_call_details.timeout,
+            metadata=client_call_details.metadata,
+            credentials=client_call_details.credentials,
+            wait_for_ready=client_call_details.wait_for_ready,
+        )
+
+        logger.debug("Rewriting gRPC path",
+                    original=original_method,
+                    rewritten=new_method.decode('utf-8'))
+
+        return await continuation(new_details, request)
 
 
 class AgentClient:
@@ -29,34 +70,38 @@ class AgentClient:
         self.port = port
         self.agent_app_id = agent_app_id
 
-        # Use TLS for production (par.pixell.global uses HTTPS)
+        # Create interceptor for ALB path-based routing if agent_app_id provided
+        interceptors = []
+        if agent_app_id:
+            path_prefix = f"/agents/{agent_app_id}/a2a"
+            interceptor = PathPrefixInterceptor(path_prefix)
+            interceptors.append(interceptor)
+            logger.info("Using path prefix for ALB routing",
+                       host=host,
+                       port=port,
+                       path_prefix=path_prefix)
+
+        # Create channel with interceptor
         if port == 443:
             # Create SSL credentials for TLS
             self.credentials = grpc.ssl_channel_credentials()
-            # For ALB routing, we need to set the correct :path header
-            # gRPC uses the service name in the path, so we'll use metadata to pass the agent ID
             self.channel = grpc.aio.secure_channel(
                 f"{host}:{port}",
                 self.credentials,
                 options=[
                     ('grpc.ssl_target_name_override', host),
-                    # Set the :authority pseudo-header for HTTP/2
                     ('grpc.default_authority', host),
-                ]
+                ],
+                interceptors=interceptors
             )
         else:
             # Insecure for local testing (direct to container)
-            self.channel = grpc.aio.insecure_channel(f"{host}:{port}")
+            self.channel = grpc.aio.insecure_channel(
+                f"{host}:{port}",
+                interceptors=interceptors
+            )
 
         self.stub = agent_pb2_grpc.AgentServiceStub(self.channel)
-
-        # Store metadata for ALB routing
-        # Note: gRPC method calls will be like /pixell.agent.AgentService/Health
-        # But ALB expects /agents/{agent_id}/a2a/*
-        # This won't work through ALB without a proxy that rewrites paths
-        self.metadata = []
-        if agent_app_id:
-            self.metadata.append(('x-agent-id', agent_app_id))
 
     async def check_health(self) -> dict:
         """Check if the agent is healthy.

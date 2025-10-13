@@ -63,7 +63,7 @@ def get_ports(prefer_fixed: bool = True) -> Tuple[int, int, int]:
     """
     # Default port ranges
     default_rest = int(os.getenv("REST_PORT", "8080"))
-    default_a2a = int(os.getenv("A2A_PORT", "50051"))
+    default_a2a = int(os.getenv("A2A_PORT", "50052"))
     default_ui = int(os.getenv("UI_PORT", "3000"))
 
     if prefer_fixed:

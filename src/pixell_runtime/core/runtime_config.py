@@ -118,7 +118,7 @@ class RuntimeConfig:
             )
         
         # A2A_PORT
-        a2a_port_str = os.getenv("A2A_PORT", "50051")
+        a2a_port_str = os.getenv("A2A_PORT", "50052")
         try:
             a2a_port = int(a2a_port_str)
             if a2a_port < 1 or a2a_port > 65535:
