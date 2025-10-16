@@ -3,7 +3,7 @@ name: "pixell-python-agent"
 display_name: "Pixell Python Agent"
 description: "Comprehensive Python code execution service for all AI Agents"
 author: "Pixell Platform Team"
-license: "MIT"
+license: "AGPL-3.0-only"
 
 # Entry point for the agent
 entrypoint: "src.pixell_adapter:main"

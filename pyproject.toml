@@ -8,14 +8,15 @@ version = "0.1.0"
 description = "Lightweight hosting layer for serving Agent Packages (APKGs)"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [
     {name = "Pixell Core Team", email = "dev@pixell.com"},
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
