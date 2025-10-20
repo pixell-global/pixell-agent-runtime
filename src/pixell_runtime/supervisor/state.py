@@ -55,7 +55,61 @@ class SupervisorState:
         # Track agent processes: agent_app_id -> AgentProcess
         self.agents: Dict[str, AgentProcess] = {}
 
+        # Ensure shared package extraction directory exists with proper permissions
+        # This directory is used by all agents (running as different users) to extract packages
+        self._initialize_shared_directories()
+
         logger.info("SupervisorState initialized")
+
+    def _initialize_shared_directories(self) -> None:
+        """Initialize shared directories used by all agents.
+
+        Creates /tmp/pixell_packages with world-writable permissions (1777) to allow
+        all agent users to extract packages. The sticky bit ensures users can only
+        delete their own directories.
+
+        Raises:
+            Logs errors but does not fail supervisor startup
+        """
+        import subprocess
+
+        packages_extract_dir = Path("/tmp/pixell_packages")
+
+        try:
+            # Create directory if it doesn't exist
+            packages_extract_dir.mkdir(parents=True, exist_ok=True)
+
+            # Set permissions to 1777 (drwxrwxrwt) - world-writable with sticky bit
+            # Sticky bit ensures users can only delete their own directories
+            subprocess.run(
+                ["chmod", "1777", str(packages_extract_dir)],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=5
+            )
+
+            logger.info(
+                "Initialized shared package extraction directory",
+                path=str(packages_extract_dir),
+                permissions="1777 (drwxrwxrwt)",
+                note="All agent users can create subdirectories for package extraction"
+            )
+
+        except subprocess.CalledProcessError as e:
+            logger.error(
+                "Failed to set permissions on package extraction directory",
+                path=str(packages_extract_dir),
+                error=e.stderr,
+                note="Agents may fail to extract packages"
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to initialize package extraction directory",
+                path=str(packages_extract_dir),
+                error=str(e),
+                note="Agents may fail to extract packages"
+            )
 
     async def deploy(self, request: DeployRequest) -> AgentProcess:
         """Deploy a new agent.
@@ -66,7 +120,7 @@ class SupervisorState:
         3. Allocate ports
         4. Download package
         5. Spawn agent process
-        6. Wait for health check
+        (Health checks handled asynchronously by ALB)
 
         Args:
             request: Deployment request
@@ -85,28 +139,98 @@ class SupervisorState:
             deployment_id=request.deployment_id,
         )
 
-        # Check if already deployed
+        # Check if already deployed (idempotent behavior)
         if agent_app_id in self.agents:
-            raise RuntimeError(f"Agent {agent_app_id} is already deployed")
+            existing = self.agents[agent_app_id]
+
+            # Case 1: Same deployment_id (idempotent retry)
+            if existing.deployment_id == request.deployment_id:
+                logger.info(
+                    "Agent already deployed with same deployment_id (idempotent)",
+                    agent_app_id=agent_app_id,
+                    deployment_id=request.deployment_id,
+                    status=existing.status.value,
+                    ports={"rest": existing.ports.rest, "a2a": existing.ports.a2a, "ui": existing.ports.ui},
+                )
+                return existing
+
+            # Case 2: Different deployment_id (update/replace)
+            if not request.allow_update:
+                # Caller doesn't want automatic updates - fail
+                raise RuntimeError(
+                    f"Agent {agent_app_id} is already deployed with different deployment_id "
+                    f"(existing: {existing.deployment_id}, requested: {request.deployment_id}). "
+                    f"Set allow_update=true to enable automatic update."
+                )
+
+            logger.info(
+                "Agent exists with different deployment_id, triggering update",
+                agent_app_id=agent_app_id,
+                old_deployment_id=existing.deployment_id,
+                new_deployment_id=request.deployment_id,
+            )
+            # Convert deploy request to update request
+            update_req = UpdateRequest(
+                agent_app_id=agent_app_id,
+                deployment_id=request.deployment_id,
+                package_url=request.package_url,
+                package_sha256=request.package_sha256,
+                version=request.version if hasattr(request, 'version') else None,
+                max_package_size_mb=request.max_package_size_mb,
+                boot_budget_ms=request.boot_budget_ms,
+                boot_hard_limit_multiplier=request.boot_hard_limit_multiplier,
+                graceful_shutdown_timeout_sec=request.graceful_shutdown_timeout_sec,
+                env=request.env,
+            )
+            return await self.update(update_req)
 
         try:
-            # Step 1: Create Linux user
-            username = self.user_manager.get_username(agent_app_id)
-            home_dir = self.user_manager.create_user(agent_app_id)
-            self.user_manager.ensure_directories(agent_app_id)
+            # Step 1: Create Linux user (with short IDs if provided)
+            username = self.user_manager.get_username(
+                agent_app_id,
+                org_short_id=request.org_short_id,
+                agent_short_id=request.agent_short_id
+            )
+            home_dir = self.user_manager.create_user(
+                agent_app_id,
+                org_short_id=request.org_short_id,
+                agent_short_id=request.agent_short_id
+            )
+            self.user_manager.ensure_directories(
+                agent_app_id,
+                org_short_id=request.org_short_id,
+                agent_short_id=request.agent_short_id
+            )
 
             logger.info("Created Linux user", agent_app_id=agent_app_id, user=username)
 
-            # Step 2: Allocate ports
-            ports = self.port_allocator.allocate(agent_app_id)
-
-            logger.info(
-                "Allocated ports",
-                agent_app_id=agent_app_id,
-                rest=ports.rest,
-                a2a=ports.a2a,
-                ui=ports.ui,
-            )
+            # Step 2: Handle port allocation
+            # Use PAC-provided ports if available, otherwise allocate internally
+            if request.ports:
+                # PAC provided ports - use them directly (DO NOT ALLOCATE)
+                ports = request.ports
+                logger.info(
+                    "Using PAC-provided ports",
+                    agent_app_id=agent_app_id,
+                    rest=ports.rest,
+                    a2a=ports.a2a,
+                    ui=ports.ui,
+                    source="pac",
+                    note="PAC manages port lifecycle"
+                )
+            else:
+                # Backward compatibility: allocate ports internally
+                # This path is for old PAC versions or testing without PAC
+                ports = self.port_allocator.allocate(agent_app_id)
+                logger.warning(
+                    "PAC did not provide ports, allocated internally",
+                    agent_app_id=agent_app_id,
+                    rest=ports.rest,
+                    a2a=ports.a2a,
+                    ui=ports.ui,
+                    source="par_internal",
+                    note="Consider upgrading PAC to use centralized allocation"
+                )
 
             # Create agent process record with allocated resources
             now = datetime.now()
@@ -149,34 +273,16 @@ class SupervisorState:
             )
             agent_process.pid = pid
             agent_process.started_at = datetime.now()
+            agent_process.status = AgentStatus.RUNNING
 
-            logger.info("Spawned agent process", agent_app_id=agent_app_id, pid=pid)
+            logger.info(
+                "Agent deployment complete - process spawned successfully",
+                agent_app_id=agent_app_id,
+                pid=pid,
+                note="ALB will handle health checks asynchronously"
+            )
 
-            # Step 5: Wait for health check (with timeout)
-            health_timeout = request.boot_budget_ms * request.boot_hard_limit_multiplier / 1000
-            health_start = datetime.now()
-
-            while (datetime.now() - health_start).total_seconds() < health_timeout:
-                is_healthy = await self.process_manager.health_check(agent_app_id, ports)
-                if is_healthy:
-                    agent_process.status = AgentStatus.RUNNING
-                    agent_process.last_health_check = datetime.now()
-                    logger.info("Agent is healthy and running", agent_app_id=agent_app_id)
-                    return agent_process
-
-                # Check if process crashed
-                if not self.process_manager.is_running(agent_app_id):
-                    agent_process.status = AgentStatus.FAILED
-                    agent_process.error_message = "Process terminated during startup"
-                    raise RuntimeError(f"Agent {agent_app_id} process terminated during startup")
-
-                # Wait before next check
-                await asyncio.sleep(0.5)
-
-            # Health check timeout
-            agent_process.status = AgentStatus.FAILED
-            agent_process.error_message = "Health check timeout"
-            raise RuntimeError(f"Agent {agent_app_id} failed health check after {health_timeout}s")
+            return agent_process
 
         except Exception as e:
             # Clean up on failure
@@ -209,7 +315,7 @@ class SupervisorState:
         2. Download new package
         3. Stop old process
         4. Spawn new process with new package
-        5. Wait for health check
+        (Health checks handled asynchronously by ALB)
 
         Args:
             request: Update request
@@ -278,38 +384,17 @@ class SupervisorState:
             )
             agent_process.pid = pid
             agent_process.started_at = datetime.now()
+            agent_process.status = AgentStatus.RUNNING
+            agent_process.error_message = None
 
-            logger.info("Spawned new agent process", agent_app_id=agent_app_id, pid=pid)
+            logger.info(
+                "Agent update complete - new process spawned successfully",
+                agent_app_id=agent_app_id,
+                pid=pid,
+                note="ALB will handle health checks asynchronously"
+            )
 
-            # Wait for health check
-            boot_budget_ms = agent_process.config.get("boot_budget_ms", 5000)
-            boot_multiplier = agent_process.config.get("boot_hard_limit_multiplier", 2.0)
-            health_timeout = boot_budget_ms * boot_multiplier / 1000
-            health_start = datetime.now()
-
-            while (datetime.now() - health_start).total_seconds() < health_timeout:
-                is_healthy = await self.process_manager.health_check(
-                    agent_app_id, agent_process.ports
-                )
-                if is_healthy:
-                    agent_process.status = AgentStatus.RUNNING
-                    agent_process.last_health_check = datetime.now()
-                    agent_process.error_message = None
-                    logger.info("Agent update successful", agent_app_id=agent_app_id)
-                    return agent_process
-
-                # Check if process crashed
-                if not self.process_manager.is_running(agent_app_id):
-                    agent_process.status = AgentStatus.FAILED
-                    agent_process.error_message = "Process terminated during update"
-                    raise RuntimeError(f"Agent {agent_app_id} process terminated during update")
-
-                await asyncio.sleep(0.5)
-
-            # Health check timeout
-            agent_process.status = AgentStatus.FAILED
-            agent_process.error_message = "Health check timeout after update"
-            raise RuntimeError(f"Agent {agent_app_id} failed health check after update")
+            return agent_process
 
         except Exception as e:
             logger.error("Agent update failed", agent_app_id=agent_app_id, error=str(e))
@@ -322,9 +407,10 @@ class SupervisorState:
 
         Steps:
         1. Stop agent process
-        2. Release ports
-        3. Delete Linux user (if requested)
-        4. Remove from state
+        2. Clean agent-specific files (logs, temp files)
+        3. Release ports
+        4. Delete Linux user (only if cleanup_user=True)
+        5. Remove from state
 
         Args:
             request: Delete request
@@ -337,7 +423,7 @@ class SupervisorState:
         """
         agent_app_id = request.agent_app_id
 
-        logger.info("Deleting agent", agent_app_id=agent_app_id, force=request.force)
+        logger.info("Deleting agent", agent_app_id=agent_app_id, force=request.force, cleanup_user=request.cleanup_user)
 
         # Verify agent exists
         if agent_app_id not in self.agents:
@@ -357,14 +443,44 @@ class SupervisorState:
             agent_process.status = AgentStatus.STOPPED
             agent_process.stopped_at = datetime.now()
 
-            # Release ports
-            self.port_allocator.release(agent_app_id)
-            logger.info("Released ports", agent_app_id=agent_app_id)
+            # Extract short IDs from linux_user field (format: "agent_ORGID_AGENTID")
+            # This allows proper user operations even if we don't have original request
+            org_short_id = None
+            agent_short_id = None
+            if agent_process.linux_user.startswith("agent_") and agent_process.linux_user.count("_") >= 2:
+                parts = agent_process.linux_user.split("_", 2)
+                if len(parts) == 3:
+                    org_short_id = parts[1]
+                    agent_short_id = parts[2]
 
-            # Delete Linux user if requested
+            # Clean agent-specific files (logs, temp files) but preserve user and reusable resources
+            self.user_manager.clean_agent_files(
+                agent_app_id,
+                org_short_id=org_short_id,
+                agent_short_id=agent_short_id
+            )
+            logger.info("Cleaned agent files", agent_app_id=agent_app_id)
+
+            # IMPORTANT: DO NOT release ports - PAC manages port lifecycle
+            # Old code removed: self.port_allocator.release(agent_app_id)
+            logger.info(
+                "Ports NOT released by PAR - PAC manages port lifecycle",
+                agent_app_id=agent_app_id,
+                ports={"rest": agent_process.ports.rest, "a2a": agent_process.ports.a2a, "ui": agent_process.ports.ui},
+                note="PAC will release ports in database"
+            )
+
+            # Delete Linux user ONLY if explicitly requested
             if request.cleanup_user:
-                self.user_manager.delete_user(agent_app_id, remove_home=True)
+                self.user_manager.delete_user(
+                    agent_app_id,
+                    org_short_id=org_short_id,
+                    agent_short_id=agent_short_id,
+                    remove_home=True
+                )
                 logger.info("Deleted Linux user", agent_app_id=agent_app_id)
+            else:
+                logger.info("Preserved Linux user for reuse", agent_app_id=agent_app_id, username=agent_process.linux_user)
 
             # Remove from state
             del self.agents[agent_app_id]

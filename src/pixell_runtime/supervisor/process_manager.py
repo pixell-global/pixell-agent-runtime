@@ -1,6 +1,7 @@
 """Process management for agent lifecycle."""
 
 import asyncio
+import os
 import subprocess
 import signal
 import time
@@ -31,6 +32,7 @@ class ProcessManager:
         """
         self.graceful_shutdown_timeout_sec = graceful_shutdown_timeout_sec
         self.processes: Dict[str, subprocess.Popen] = {}  # agent_app_id -> Popen
+        self.log_files: Dict[str, 'IO[str]'] = {}  # agent_app_id -> log file handle
         logger.info(
             "ProcessManager initialized",
             graceful_shutdown_timeout_sec=graceful_shutdown_timeout_sec,
@@ -67,44 +69,67 @@ class ProcessManager:
             ports={"rest": ports.rest, "a2a": ports.a2a, "ui": ports.ui},
         )
 
-        # Build environment variables
+        # Determine home directory for agent user
+        # Format: /home/agent_xxx where xxx matches linux_user suffix
+        home_dir = f"/home/{linux_user}"
+
+        # Build environment variables - start from supervisor's environment
         process_env = {
+            **os.environ,  # Inherit supervisor's PATH and system environment
+            # Agent-specific variables
             "AGENT_APP_ID": agent_app_id,
             "AGENT_PACKAGE_PATH": str(package_path),
-            "PACKAGE_URL": f"file://{package_path}",  # For compatibility
+            # NOTE: PACKAGE_URL not set - runtime will use AGENT_PACKAGE_PATH instead
+            # Runtime validation rejects file:// URLs, and AGENT_PACKAGE_PATH is preferred
             "REST_PORT": str(ports.rest),
             "A2A_PORT": str(ports.a2a),
             "UI_PORT": str(ports.ui),
             "BASE_PATH": f"/agents/{agent_app_id}",
             "MULTIPLEXED": "true",
             "PYTHONUNBUFFERED": "1",  # Ensure logs are not buffered
+            "HOME": home_dir,  # Set HOME for agent user (UV/pip need this for cache)
         }
 
         # Add custom environment variables
         if env:
             process_env.update(env)
 
-        # Convert env dict to string for shell
-        env_string = " ".join([f"{k}={v}" for k, v in process_env.items()])
+        # Fix ownership of extracted package directory if it exists
+        # This prevents permission errors when packages were extracted by a different user
+        self._ensure_package_ownership(agent_app_id, linux_user, package_path)
 
-        # Command to run as different user
-        # su - <user> -s /bin/bash -c "export ENV_VARS && python -m pixell_runtime"
+        # Command to run - direct Python invocation (no shell, no su)
         cmd = [
-            "su",
-            "-",
-            linux_user,
-            "-s",
-            "/bin/bash",
-            "-c",
-            f"{env_string} python -m pixell_runtime",
+            "/usr/bin/python3.11",
+            "-m",
+            "pixell_runtime",
         ]
 
         try:
-            # Spawn process
+            # Create log directory and file for agent output
+            log_dir = Path("/var/lib/pixell/logs")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / f"agent_{agent_app_id}.log"
+
+            # Open log file with line buffering for real-time output
+            log_handle = open(log_file, "w", buffering=1)
+            self.log_files[agent_app_id] = log_handle
+
+            logger.info(
+                "Created log file for agent",
+                agent_app_id=agent_app_id,
+                log_file=str(log_file),
+            )
+
+            # Spawn process as target user using native Python API (Python 3.9+)
+            # This is the production-standard way to spawn processes as different users.
+            # Much more reliable than using 'su' - no shell involved, env vars work correctly.
             process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                user=linux_user,  # Python 3.9+ native user switching
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,  # Merge stderr into stdout for unified log
+                env=process_env,
                 preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
             )
 
@@ -128,6 +153,87 @@ class ProcessManager:
                 exc_info=True,
             )
             raise RuntimeError(f"Failed to spawn agent {agent_app_id}: {e}") from e
+
+    def _ensure_package_ownership(
+        self, agent_app_id: str, linux_user: str, package_path: Path
+    ) -> None:
+        """Ensure extracted package directory is owned by the agent user.
+
+        This fixes permission issues when packages are extracted by different users
+        (e.g., supervisor as root, or previously by another agent user).
+
+        Args:
+            agent_app_id: Agent identifier
+            linux_user: Linux username to set as owner
+            package_path: Path to the .apkg file
+
+        Note:
+            This is a best-effort operation. Failures are logged but don't prevent
+            agent startup, as the agent will attempt extraction anyway.
+        """
+        import zipfile
+        import yaml
+
+        try:
+            # Read manifest from .apkg to get package_id
+            with zipfile.ZipFile(package_path, 'r') as zf:
+                if 'agent.yaml' not in zf.namelist():
+                    logger.debug(
+                        "Cannot determine package_id - agent.yaml not in .apkg",
+                        agent_app_id=agent_app_id
+                    )
+                    return
+
+                with zf.open('agent.yaml') as f:
+                    manifest = yaml.safe_load(f)
+                    package_id = f"{manifest['name']}@{manifest['version']}"
+                    extracted_dir = Path("/tmp/pixell_packages") / package_id
+
+                    # If directory exists, fix ownership
+                    if extracted_dir.exists():
+                        logger.info(
+                            "Fixing ownership of existing extracted package",
+                            agent_app_id=agent_app_id,
+                            path=str(extracted_dir),
+                            owner=linux_user
+                        )
+
+                        result = subprocess.run(
+                            ["chown", "-R", f"{linux_user}:{linux_user}", str(extracted_dir)],
+                            capture_output=True,
+                            text=True,
+                            check=False,  # Don't fail if this doesn't work
+                            timeout=10
+                        )
+
+                        if result.returncode == 0:
+                            logger.info(
+                                "Successfully fixed package directory ownership",
+                                agent_app_id=agent_app_id,
+                                path=str(extracted_dir)
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to fix package directory ownership",
+                                agent_app_id=agent_app_id,
+                                path=str(extracted_dir),
+                                error=result.stderr,
+                                note="Agent will attempt extraction anyway"
+                            )
+
+        except zipfile.BadZipFile:
+            logger.debug(
+                "Package file is not a valid zip",
+                agent_app_id=agent_app_id,
+                path=str(package_path)
+            )
+        except Exception as e:
+            logger.debug(
+                "Could not pre-fix package directory ownership",
+                agent_app_id=agent_app_id,
+                error=str(e),
+                note="Agent will attempt extraction anyway"
+            )
 
     def is_running(self, agent_app_id: str) -> bool:
         """Check if agent process is running.
@@ -184,6 +290,13 @@ class ProcessManager:
         # Check if already stopped
         if process.poll() is not None:
             logger.info("Agent process already stopped", agent_app_id=agent_app_id, pid=pid)
+            # Close log file if open
+            if agent_app_id in self.log_files:
+                try:
+                    self.log_files[agent_app_id].close()
+                except Exception:
+                    pass
+                del self.log_files[agent_app_id]
             del self.processes[agent_app_id]
             return True
 
@@ -220,6 +333,13 @@ class ProcessManager:
                     process.wait(timeout=5)
 
             # Clean up
+            # Close log file if open
+            if agent_app_id in self.log_files:
+                try:
+                    self.log_files[agent_app_id].close()
+                except Exception:
+                    pass
+                del self.log_files[agent_app_id]
             del self.processes[agent_app_id]
             return True
 
@@ -332,3 +452,10 @@ class ProcessManager:
         """Clean up process manager resources."""
         logger.info("Cleaning up ProcessManager")
         self.stop_all(force=True)
+        # Close any remaining log files
+        for agent_id, log_handle in list(self.log_files.items()):
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+        self.log_files.clear()
