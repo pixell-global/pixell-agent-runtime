@@ -99,8 +99,15 @@ class PackageLoader:
                 if final_path.exists():
                     logger.warning("Package already exists, replacing", package_id=package_id)
                     shutil.rmtree(final_path)
-                
-                shutil.move(temp_dir, str(final_path))
+
+                try:
+                    shutil.move(temp_dir, str(final_path))
+                except PermissionError as e:
+                    raise PackageLoadError(
+                        f"Permission denied when moving package to {final_path}. "
+                        f"This usually indicates {self.packages_dir} has incorrect permissions. "
+                        f"Ensure it exists with mode 1777 (drwxrwxrwt). Original error: {e}"
+                    ) from e
 
                 # Create or reuse virtual environment
                 venv_path = self._ensure_venv(package_id, final_path, agent_app_id)

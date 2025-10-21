@@ -386,3 +386,164 @@ def test_cors_and_error_handling(client):
 
     # Check that exception handler is registered
     assert len(app.exception_handlers) > 0
+
+
+def test_get_agent_status_for_zombie_process(client, mock_supervisor_state):
+    """Test that /agents/{id}/status reports zombies as failed."""
+    # Create mock agent
+    agent = AgentProcess(
+        agent_app_id="zombie-agent",
+        deployment_id="dep-123",
+        status=AgentStatus.RUNNING,  # Supervisor thinks it's running
+        ports=Ports(rest=8081, a2a=50052, ui=3001),
+        linux_user="agent_zombie",
+        package_path="/test.apkg",
+        package_url="s3://bucket/package.apkg",
+        created_at=datetime.now(),
+        started_at=datetime.now(),
+        pid=12345,
+        config={},
+    )
+    mock_supervisor_state.get_agent.return_value = agent
+
+    # Mock process_manager.get_process_health() to report zombie
+    mock_process_manager = MagicMock()
+    mock_process_manager.get_process_health.return_value = {
+        "is_alive": False,
+        "is_zombie": True,
+        "memory_mb": 0.0,
+        "cpu_percent": 0.0,
+        "pid": 12345,
+    }
+    mock_supervisor_state.process_manager = mock_process_manager
+
+    # Get agent status
+    response = client.get("/agents/zombie-agent/status")
+
+    assert response.status_code == 200
+    data = response.json()
+
+    # Zombie should be reported as failed, not running
+    assert data["status"] == "failed"
+    assert data["process_id"] == 12345
+
+    # Health should be all False
+    assert data["health"]["rest"] is False
+    assert data["health"]["a2a"] is False
+    assert data["health"]["ui"] is False
+
+    # Metrics should be zero
+    assert data["memory_mb"] == 0.0
+    assert data["cpu_percent"] == 0.0
+
+    # Uptime should be zero
+    assert data["uptime_seconds"] == 0
+
+
+def test_get_agent_status_for_healthy_process(client, mock_supervisor_state):
+    """Test that /agents/{id}/status reports healthy processes correctly."""
+    from datetime import datetime
+
+    # Use utcnow consistently
+    now = datetime.utcnow()
+
+    # Create mock healthy agent
+    agent = AgentProcess(
+        agent_app_id="healthy-agent",
+        deployment_id="dep-123",
+        status=AgentStatus.RUNNING,
+        ports=Ports(rest=8081, a2a=50052, ui=3001),
+        linux_user="agent_healthy",
+        package_path="/test.apkg",
+        package_url="s3://bucket/package.apkg",
+        created_at=now,
+        started_at=now,
+        pid=12345,
+        config={},
+    )
+    mock_supervisor_state.get_agent.return_value = agent
+
+    # Mock process_manager.get_process_health() to report healthy
+    mock_process_manager = MagicMock()
+    mock_process_manager.get_process_health.return_value = {
+        "is_alive": True,
+        "is_zombie": False,
+        "memory_mb": 150.5,
+        "cpu_percent": 25.3,
+        "pid": 12345,
+    }
+    mock_supervisor_state.process_manager = mock_process_manager
+
+    # Get agent status
+    response = client.get("/agents/healthy-agent/status")
+
+    assert response.status_code == 200
+    data = response.json()
+
+    # Should be reported as running
+    assert data["status"] == "running"
+    assert data["process_id"] == 12345
+
+    # Health should be all True
+    assert data["health"]["rest"] is True
+    assert data["health"]["a2a"] is True
+    assert data["health"]["ui"] is True
+
+    # Metrics should be non-zero
+    assert data["memory_mb"] == 150.5
+    assert data["cpu_percent"] == 25.3
+
+    # Uptime should be calculated (allow small tolerance for test execution time)
+    assert data["uptime_seconds"] >= 0
+    assert data["uptime_seconds"] < 10  # Should be very small in test
+
+
+def test_get_agent_status_for_stopped_process(client, mock_supervisor_state):
+    """Test that /agents/{id}/status reports stopped processes correctly."""
+    # Create mock stopped agent
+    agent = AgentProcess(
+        agent_app_id="stopped-agent",
+        deployment_id="dep-123",
+        status=AgentStatus.STOPPED,
+        ports=Ports(rest=8081, a2a=50052, ui=3001),
+        linux_user="agent_stopped",
+        package_path="/test.apkg",
+        package_url="s3://bucket/package.apkg",
+        created_at=datetime.now(),
+        stopped_at=datetime.now(),
+        pid=12345,
+        config={},
+    )
+    mock_supervisor_state.get_agent.return_value = agent
+
+    # Mock process_manager.get_process_health() to report not alive
+    mock_process_manager = MagicMock()
+    mock_process_manager.get_process_health.return_value = {
+        "is_alive": False,
+        "is_zombie": False,
+        "memory_mb": 0.0,
+        "cpu_percent": 0.0,
+        "pid": 12345,
+    }
+    mock_supervisor_state.process_manager = mock_process_manager
+
+    # Get agent status
+    response = client.get("/agents/stopped-agent/status")
+
+    assert response.status_code == 200
+    data = response.json()
+
+    # Should be reported as stopped
+    assert data["status"] == "stopped"
+
+    # Health should be all False
+    assert data["health"]["rest"] is False
+    assert data["health"]["a2a"] is False
+    assert data["health"]["ui"] is False
+
+    # Metrics should be zero
+    assert data["memory_mb"] == 0.0
+    assert data["cpu_percent"] == 0.0
+
+    # Uptime should be zero
+    assert data["uptime_seconds"] == 0

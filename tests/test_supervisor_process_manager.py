@@ -13,13 +13,22 @@ from pixell_runtime.supervisor.models import AgentStatus, Ports
 @pytest.fixture
 def mock_ports():
     """Create mock ports."""
-    return Ports(rest=8081, a2a=50052, ui=3001)
+    return Ports(rest=63000, a2a=60000, ui=65000)
 
 
 @pytest.fixture
 def process_manager():
     """Create ProcessManager instance."""
     return ProcessManager(graceful_shutdown_timeout_sec=5)
+
+
+@pytest.fixture
+def mock_filesystem():
+    """Mock filesystem operations for process manager tests."""
+    with patch("pathlib.Path.mkdir"), patch("builtins.open", new_callable=MagicMock) as mock_open:
+        mock_log_file = MagicMock()
+        mock_open.return_value = mock_log_file
+        yield mock_open
 
 
 def test_process_manager_init():
@@ -30,7 +39,7 @@ def test_process_manager_init():
 
 
 @patch("subprocess.Popen")
-def test_spawn_agent_success(mock_popen, process_manager, mock_ports):
+def test_spawn_agent_success(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test successful agent spawn."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -52,10 +61,21 @@ def test_spawn_agent_success(mock_popen, process_manager, mock_ports):
     assert mock_popen.called
     call_args = mock_popen.call_args
     cmd = call_args[0][0]
+    kwargs = call_args[1]
 
-    assert cmd[0] == "su"
-    assert cmd[2] == "agent_4906eeb7"
-    assert "python -m pixell_runtime" in cmd[-1]
+    # Check command structure: ["/usr/bin/python3.11", "-m", "pixell_runtime"]
+    assert cmd == ["/usr/bin/python3.11", "-m", "pixell_runtime"]
+
+    # Check that user parameter was passed (Python 3.9+ native user switching)
+    assert "user" in kwargs
+    assert kwargs["user"] == "agent_4906eeb7"
+
+    # Check that env dict was passed to Popen
+    assert "env" in kwargs
+    assert "AGENT_APP_ID" in kwargs["env"]
+    assert "AGENT_PACKAGE_PATH" in kwargs["env"]
+    assert "CUSTOM_VAR" in kwargs["env"]
+    assert kwargs["env"]["CUSTOM_VAR"] == "value"
 
 
 @patch("subprocess.Popen")
@@ -78,7 +98,7 @@ def test_is_running_not_exists(process_manager):
 
 
 @patch("subprocess.Popen")
-def test_is_running_exists_running(mock_popen, process_manager, mock_ports):
+def test_is_running_exists_running(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test is_running for running agent."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -96,7 +116,7 @@ def test_is_running_exists_running(mock_popen, process_manager, mock_ports):
 
 
 @patch("subprocess.Popen")
-def test_is_running_exists_stopped(mock_popen, process_manager, mock_ports):
+def test_is_running_exists_stopped(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test is_running for stopped agent."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -119,7 +139,7 @@ def test_get_pid_not_exists(process_manager):
 
 
 @patch("subprocess.Popen")
-def test_get_pid_exists(mock_popen, process_manager, mock_ports):
+def test_get_pid_exists(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test get_pid for existing agent."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -142,7 +162,7 @@ def test_stop_agent_not_exists(process_manager):
 
 
 @patch("subprocess.Popen")
-def test_stop_agent_already_stopped(mock_popen, process_manager, mock_ports):
+def test_stop_agent_already_stopped(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test stopping already stopped agent."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -162,7 +182,7 @@ def test_stop_agent_already_stopped(mock_popen, process_manager, mock_ports):
 
 
 @patch("subprocess.Popen")
-def test_stop_agent_graceful(mock_popen, process_manager, mock_ports):
+def test_stop_agent_graceful(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test graceful agent stop."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -187,7 +207,7 @@ def test_stop_agent_graceful(mock_popen, process_manager, mock_ports):
 
 
 @patch("subprocess.Popen")
-def test_stop_agent_force(mock_popen, process_manager, mock_ports):
+def test_stop_agent_force(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test force kill agent."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -212,7 +232,7 @@ def test_stop_agent_force(mock_popen, process_manager, mock_ports):
 
 
 @patch("subprocess.Popen")
-def test_stop_agent_timeout_then_kill(mock_popen, process_manager, mock_ports):
+def test_stop_agent_timeout_then_kill(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test graceful stop that times out and requires force kill."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -247,7 +267,7 @@ async def test_health_check_not_running(process_manager, mock_ports):
 
 @pytest.mark.asyncio
 @patch("subprocess.Popen")
-async def test_health_check_http_success(mock_popen, process_manager, mock_ports):
+async def test_health_check_http_success(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test successful health check."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -277,7 +297,7 @@ async def test_health_check_http_success(mock_popen, process_manager, mock_ports
 
 @pytest.mark.asyncio
 @patch("subprocess.Popen")
-async def test_health_check_http_unhealthy(mock_popen, process_manager, mock_ports):
+async def test_health_check_http_unhealthy(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test health check with unhealthy response."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -307,7 +327,7 @@ async def test_health_check_http_unhealthy(mock_popen, process_manager, mock_por
 
 @pytest.mark.asyncio
 @patch("subprocess.Popen")
-async def test_health_check_http_error(mock_popen, process_manager, mock_ports):
+async def test_health_check_http_error(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test health check with HTTP error."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -338,7 +358,7 @@ def test_get_process_status_not_exists(process_manager):
 
 
 @patch("subprocess.Popen")
-def test_get_process_status_running(mock_popen, process_manager, mock_ports):
+def test_get_process_status_running(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test get_process_status for running agent."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -357,7 +377,7 @@ def test_get_process_status_running(mock_popen, process_manager, mock_ports):
 
 
 @patch("subprocess.Popen")
-def test_get_process_status_failed(mock_popen, process_manager, mock_ports):
+def test_get_process_status_failed(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test get_process_status for failed agent."""
     mock_process = MagicMock()
     mock_process.pid = 12345
@@ -376,7 +396,7 @@ def test_get_process_status_failed(mock_popen, process_manager, mock_ports):
 
 
 @patch("subprocess.Popen")
-def test_stop_all(mock_popen, process_manager, mock_ports):
+def test_stop_all(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test stopping all agents."""
     # Spawn 3 agents
     for i in range(3):
@@ -386,7 +406,7 @@ def test_stop_all(mock_popen, process_manager, mock_ports):
         mock_process.wait.return_value = None
         mock_popen.return_value = mock_process
 
-        ports = Ports(rest=8081 + i, a2a=50052 + i, ui=3001 + i)
+        ports = Ports(rest=63000 + i, a2a=60000 + i, ui=65000 + i)
         process_manager.spawn_agent(
             agent_app_id=f"agent_{i}",
             linux_user=f"agent_agent_{i}",
@@ -403,7 +423,7 @@ def test_stop_all(mock_popen, process_manager, mock_ports):
 
 
 @patch("subprocess.Popen")
-def test_stop_all_with_error(mock_popen, process_manager, mock_ports):
+def test_stop_all_with_error(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test stop_all continues on error."""
     # Spawn 2 agents
     for i in range(2):
@@ -419,7 +439,7 @@ def test_stop_all_with_error(mock_popen, process_manager, mock_ports):
 
         mock_popen.return_value = mock_process
 
-        ports = Ports(rest=8081 + i, a2a=50052 + i, ui=3001 + i)
+        ports = Ports(rest=63000 + i, a2a=60000 + i, ui=65000 + i)
         process_manager.spawn_agent(
             agent_app_id=f"agent_{i}",
             linux_user=f"agent_agent_{i}",
@@ -434,7 +454,7 @@ def test_stop_all_with_error(mock_popen, process_manager, mock_ports):
 
 
 @patch("subprocess.Popen")
-def test_cleanup(mock_popen, process_manager, mock_ports):
+def test_cleanup(mock_popen, process_manager, mock_ports, mock_filesystem):
     """Test cleanup stops all processes."""
     # Spawn agents
     for i in range(2):
@@ -444,7 +464,7 @@ def test_cleanup(mock_popen, process_manager, mock_ports):
         mock_process.wait.return_value = None
         mock_popen.return_value = mock_process
 
-        ports = Ports(rest=8081 + i, a2a=50052 + i, ui=3001 + i)
+        ports = Ports(rest=63000 + i, a2a=60000 + i, ui=65000 + i)
         process_manager.spawn_agent(
             agent_app_id=f"agent_{i}",
             linux_user=f"agent_agent_{i}",
@@ -454,3 +474,117 @@ def test_cleanup(mock_popen, process_manager, mock_ports):
 
     process_manager.cleanup()
     assert len(process_manager.processes) == 0
+
+
+# Tests for Issue #2 fix: package ownership
+@patch("subprocess.run")
+@patch("zipfile.ZipFile")
+@patch("yaml.safe_load")
+def test_ensure_package_ownership_success(mock_yaml_load, mock_zipfile, mock_subprocess_run, process_manager):
+    """Test successful package ownership fix."""
+    # Mock the zipfile to contain agent.yaml
+    mock_zf = MagicMock()
+    mock_zipfile.return_value.__enter__.return_value = mock_zf
+    mock_zf.namelist.return_value = ["agent.yaml", "other_file.py"]
+
+    # Mock the manifest yaml content
+    mock_yaml_load.return_value = {"name": "test-agent", "version": "1.0.0"}
+
+    # Mock subprocess to succeed
+    mock_subprocess_run.return_value = MagicMock(returncode=0, stderr="")
+
+    # Mock directory exists
+    with patch("pathlib.Path.exists", return_value=True):
+        process_manager._ensure_package_ownership(
+            agent_app_id="test-agent-id",
+            linux_user="agent_test",
+            package_path=Path("/var/lib/pixell/packages/test.apkg")
+        )
+
+    # Verify chown was called
+    assert mock_subprocess_run.called
+    call_args = mock_subprocess_run.call_args[0][0]
+    assert call_args[0] == "chown"
+    assert call_args[1] == "-R"
+    assert "agent_test:agent_test" in call_args[2]
+
+
+@patch("zipfile.ZipFile")
+def test_ensure_package_ownership_no_manifest(mock_zipfile, process_manager):
+    """Test when agent.yaml is missing from package."""
+    # Mock the zipfile without agent.yaml
+    mock_zf = MagicMock()
+    mock_zipfile.return_value.__enter__.return_value = mock_zf
+    mock_zf.namelist.return_value = ["other_file.py"]
+
+    # Should not raise - just log and return
+    process_manager._ensure_package_ownership(
+        agent_app_id="test-agent-id",
+        linux_user="agent_test",
+        package_path=Path("/var/lib/pixell/packages/test.apkg")
+    )
+
+    # Should not have tried to open agent.yaml
+    assert not mock_zf.open.called
+
+
+@patch("zipfile.ZipFile")
+def test_ensure_package_ownership_bad_zipfile(mock_zipfile, process_manager):
+    """Test handling of bad/corrupt zip file."""
+    # Mock bad zipfile
+    import zipfile
+    mock_zipfile.side_effect = zipfile.BadZipFile("Not a zip file")
+
+    # Should not raise - just log and return
+    process_manager._ensure_package_ownership(
+        agent_app_id="test-agent-id",
+        linux_user="agent_test",
+        package_path=Path("/var/lib/pixell/packages/test.apkg")
+    )
+
+
+@patch("subprocess.run")
+@patch("zipfile.ZipFile")
+@patch("yaml.safe_load")
+def test_ensure_package_ownership_directory_not_exists(mock_yaml_load, mock_zipfile, mock_subprocess_run, process_manager):
+    """Test when extracted directory doesn't exist yet."""
+    # Mock the zipfile
+    mock_zf = MagicMock()
+    mock_zipfile.return_value.__enter__.return_value = mock_zf
+    mock_zf.namelist.return_value = ["agent.yaml"]
+    mock_yaml_load.return_value = {"name": "test-agent", "version": "1.0.0"}
+
+    # Mock directory doesn't exist
+    with patch("pathlib.Path.exists", return_value=False):
+        process_manager._ensure_package_ownership(
+            agent_app_id="test-agent-id",
+            linux_user="agent_test",
+            package_path=Path("/var/lib/pixell/packages/test.apkg")
+        )
+
+    # Chown should not be called if directory doesn't exist
+    assert not mock_subprocess_run.called
+
+
+@patch("subprocess.run")
+@patch("zipfile.ZipFile")
+@patch("yaml.safe_load")
+def test_ensure_package_ownership_chown_failure(mock_yaml_load, mock_zipfile, mock_subprocess_run, process_manager):
+    """Test when chown fails (non-fatal)."""
+    # Mock the zipfile
+    mock_zf = MagicMock()
+    mock_zipfile.return_value.__enter__.return_value = mock_zf
+    mock_zf.namelist.return_value = ["agent.yaml"]
+    mock_yaml_load.return_value = {"name": "test-agent", "version": "1.0.0"}
+
+    # Mock subprocess to fail
+    mock_subprocess_run.return_value = MagicMock(returncode=1, stderr="Permission denied")
+
+    # Mock directory exists
+    with patch("pathlib.Path.exists", return_value=True):
+        # Should not raise - just log warning
+        process_manager._ensure_package_ownership(
+            agent_app_id="test-agent-id",
+            linux_user="agent_test",
+            package_path=Path("/var/lib/pixell/packages/test.apkg")
+        )
