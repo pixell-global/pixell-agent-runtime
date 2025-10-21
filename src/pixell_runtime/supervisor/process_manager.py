@@ -6,7 +6,7 @@ import subprocess
 import signal
 import time
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 import structlog
 
 from pixell_runtime.supervisor.models import AgentProcess, AgentStatus, Ports
@@ -235,20 +235,188 @@ class ProcessManager:
                 note="Agent will attempt extraction anyway"
             )
 
-    def is_running(self, agent_app_id: str) -> bool:
-        """Check if agent process is running.
+    def is_process_zombie(self, pid: Optional[int]) -> bool:
+        """Check if a process is a zombie.
+
+        A zombie process is a terminated process that hasn't been reaped by its parent.
+        Zombies remain in the process table with state 'Z' until reaped via wait()/waitpid().
+
+        Args:
+            pid: Process ID to check
+
+        Returns:
+            True if process is a zombie, False otherwise (including if process doesn't exist)
+
+        Notes:
+            - Uses psutil for cross-platform compatibility (Linux, macOS)
+            - Returns False if process doesn't exist or psutil unavailable
+            - Zombies have status psutil.STATUS_ZOMBIE or 'zombie' string
+        """
+        if pid is None:
+            return False
+
+        try:
+            import psutil
+
+            process = psutil.Process(pid)
+            status = process.status()
+
+            # Cross-platform zombie detection
+            # psutil.STATUS_ZOMBIE is a constant on all platforms
+            is_zombie = (
+                status == psutil.STATUS_ZOMBIE
+                or status == "zombie"
+                or status == "Z"
+            )
+
+            if is_zombie:
+                logger.debug(
+                    "Detected zombie process",
+                    pid=pid,
+                    status=status,
+                )
+
+            return is_zombie
+
+        except ImportError:
+            logger.warning(
+                "psutil not available - cannot detect zombie processes",
+                pid=pid,
+            )
+            return False
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # Process doesn't exist or we can't access it
+            logger.debug("Process not found or access denied", pid=pid)
+            return False
+        except Exception as e:
+            logger.warning(
+                "Error checking if process is zombie",
+                pid=pid,
+                error=str(e),
+            )
+            return False
+
+    def get_process_health(self, agent_app_id: str) -> Dict[str, Any]:
+        """Get comprehensive process health information.
+
+        This method performs real-time checks to determine if a process is:
+        - Alive and running
+        - A zombie (crashed but not reaped)
+        - Stopped/terminated
 
         Args:
             agent_app_id: Agent identifier
 
         Returns:
-            True if process is running, False otherwise
+            Dictionary with:
+            - is_alive: bool - Process is running and not a zombie
+            - is_zombie: bool - Process is a zombie
+            - memory_mb: float - Memory usage in MB (0.0 if zombie/stopped)
+            - cpu_percent: float - CPU usage percent (0.0 if zombie/stopped)
+            - pid: Optional[int] - Process ID
+
+        Notes:
+            - This is the authoritative health check for status endpoints
+            - Zombies return is_alive=False, is_zombie=True, metrics=0
+            - Gracefully handles psutil unavailable or process not found
+        """
+        if agent_app_id not in self.processes:
+            return {
+                "is_alive": False,
+                "is_zombie": False,
+                "memory_mb": 0.0,
+                "cpu_percent": 0.0,
+                "pid": None,
+            }
+
+        process = self.processes[agent_app_id]
+        pid = process.pid
+
+        # Check if process has terminated
+        if process.poll() is not None:
+            return {
+                "is_alive": False,
+                "is_zombie": False,
+                "memory_mb": 0.0,
+                "cpu_percent": 0.0,
+                "pid": pid,
+            }
+
+        # Check if process is a zombie
+        is_zombie = self.is_process_zombie(pid)
+
+        if is_zombie:
+            return {
+                "is_alive": False,
+                "is_zombie": True,
+                "memory_mb": 0.0,
+                "cpu_percent": 0.0,
+                "pid": pid,
+            }
+
+        # Process is alive - get metrics
+        memory_mb = 0.0
+        cpu_percent = 0.0
+
+        try:
+            import psutil
+
+            ps_process = psutil.Process(pid)
+            memory_mb = ps_process.memory_info().rss / (1024 * 1024)  # bytes to MB
+            cpu_percent = ps_process.cpu_percent(interval=0.1)
+
+        except ImportError:
+            logger.debug("psutil not available for metrics", agent_app_id=agent_app_id)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            logger.debug(
+                "Cannot get process metrics",
+                agent_app_id=agent_app_id,
+                pid=pid,
+            )
+        except Exception as e:
+            logger.warning(
+                "Error getting process metrics",
+                agent_app_id=agent_app_id,
+                pid=pid,
+                error=str(e),
+            )
+
+        return {
+            "is_alive": True,
+            "is_zombie": False,
+            "memory_mb": memory_mb,
+            "cpu_percent": cpu_percent,
+            "pid": pid,
+        }
+
+    def is_running(self, agent_app_id: str) -> bool:
+        """Check if agent process is running AND not a zombie.
+
+        Args:
+            agent_app_id: Agent identifier
+
+        Returns:
+            True if process is running and alive (not zombie), False otherwise
+
+        Notes:
+            - Zombies are NOT considered running (they're dead but not reaped)
+            - This method now uses real-time zombie detection
+            - Changed from old behavior which considered zombies as "running"
         """
         if agent_app_id not in self.processes:
             return False
 
         process = self.processes[agent_app_id]
-        return process.poll() is None
+
+        # Check if process has terminated
+        if process.poll() is not None:
+            return False
+
+        # Check if process is a zombie (terminated but not reaped)
+        if self.is_process_zombie(process.pid):
+            return False
+
+        return True
 
     def get_pid(self, agent_app_id: str) -> Optional[int]:
         """Get process ID for an agent.

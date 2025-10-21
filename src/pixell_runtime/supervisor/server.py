@@ -22,30 +22,50 @@ from pixell_runtime.supervisor.models import (
     AgentStatus,
 )
 from pixell_runtime.supervisor.state import SupervisorState
+from pixell_runtime.supervisor.grpc_gateway import GrpcGateway
 
 logger = structlog.get_logger()
 
 
-# Global supervisor state
+# Global supervisor state and gateway
 supervisor_state: Optional[SupervisorState] = None
+grpc_gateway: Optional[GrpcGateway] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for FastAPI app.
 
-    Initializes supervisor state on startup and cleans up on shutdown.
+    Initializes supervisor state and gRPC gateway on startup,
+    cleans up on shutdown.
     """
-    global supervisor_state
+    global supervisor_state, grpc_gateway
 
     # Startup
     logger.info("Starting supervisor server")
     supervisor_state = SupervisorState()
 
+    # Start gRPC gateway for path-based routing
+    logger.info("Starting gRPC gateway for agent routing")
+    grpc_gateway = GrpcGateway(supervisor_state)
+    await grpc_gateway.start()
+    logger.info(
+        "gRPC gateway started",
+        gateway_port=grpc_gateway.port,
+        note="Gateway routes /agents/{id}/a2a/* to agent ports 60000-60199"
+    )
+
     yield
 
     # Shutdown
     logger.info("Shutting down supervisor server")
+
+    # Stop gateway first
+    if grpc_gateway:
+        logger.info("Stopping gRPC gateway")
+        await grpc_gateway.stop()
+
+    # Then cleanup supervisor state
     if supervisor_state:
         await supervisor_state.cleanup()
 
@@ -238,13 +258,13 @@ async def update_agent(agent_app_id: str, request: UpdateRequest):
 
 
 @app.delete("/agents/{agent_app_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_agent(agent_app_id: str, force: bool = False, cleanup_user: bool = True):
+async def delete_agent(agent_app_id: str, force: bool = False, cleanup_user: bool = False):
     """Delete an agent deployment.
 
     Args:
         agent_app_id: Agent identifier
         force: Force kill process immediately
-        cleanup_user: Delete Linux user and home directory
+        cleanup_user: Delete Linux user and home directory (default: False, user is preserved for fast redeployment)
 
     Raises:
         HTTPException: If deletion fails
@@ -348,38 +368,48 @@ async def get_agent_status(agent_app_id: str):
             detail=f"Agent {agent_app_id} not found",
         )
 
-    # Calculate uptime
-    uptime_seconds = 0
-    if agent.started_at:
-        from datetime import datetime
-        uptime_seconds = int((datetime.utcnow() - agent.started_at).total_seconds())
+    # Get real-time process health (detects zombies immediately)
+    process_health = supervisor_state.process_manager.get_process_health(agent_app_id)
 
-    # Get process metrics (placeholder - could be enhanced with psutil)
-    memory_mb = 0.0
-    cpu_percent = 0.0
-    try:
-        import psutil
-        if agent.pid:
-            process = psutil.Process(agent.pid)
-            memory_mb = process.memory_info().rss / (1024 * 1024)  # bytes to MB
-            cpu_percent = process.cpu_percent(interval=0.1)
-    except (ImportError, psutil.NoSuchProcess, psutil.AccessDenied):
-        pass  # If psutil not available or process not found, use defaults
+    # Determine actual status - override agent.status if zombie detected
+    # This prevents false positives during the window before zombie reaper runs
+    if process_health["is_zombie"]:
+        # Zombie detected - report as failed
+        actual_status = "failed"
+        health = {"rest": False, "a2a": False, "ui": False}
+        uptime_seconds = 0
+        logger.warning(
+            "Agent process is zombie - reporting as failed",
+            agent_app_id=agent_app_id,
+            pid=agent.pid,
+        )
+    elif not process_health["is_alive"]:
+        # Process stopped/terminated
+        actual_status = "stopped"
+        health = {"rest": False, "a2a": False, "ui": False}
+        uptime_seconds = 0
+    else:
+        # Process is alive - use supervisor state
+        actual_status = agent.status.value
+        health = {
+            "rest": agent.status == AgentStatus.RUNNING,
+            "a2a": agent.status == AgentStatus.RUNNING,
+            "ui": agent.status == AgentStatus.RUNNING,
+        }
 
-    # Health status per port (simplified - could add actual health checks)
-    health = {
-        "rest": agent.status == AgentStatus.RUNNING,
-        "a2a": agent.status == AgentStatus.RUNNING,
-        "ui": agent.status == AgentStatus.RUNNING,
-    }
+        # Calculate uptime only for alive processes
+        uptime_seconds = 0
+        if agent.started_at:
+            from datetime import datetime
+            uptime_seconds = int((datetime.utcnow() - agent.started_at).total_seconds())
 
     return AgentStatusResponse(
         agent_app_id=agent.agent_app_id,
-        status=agent.status.value,
+        status=actual_status,  # Use real-time status instead of cached agent.status
         process_id=agent.pid,  # PAC expects 'process_id', not 'pid'
         uptime_seconds=uptime_seconds,
-        memory_mb=memory_mb,
-        cpu_percent=cpu_percent,
+        memory_mb=process_health["memory_mb"],
+        cpu_percent=process_health["cpu_percent"],
         ports=agent.ports,
         health=health,
     )
