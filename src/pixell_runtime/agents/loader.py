@@ -43,7 +43,10 @@ class PackageLoader:
         self.venvs_dir.mkdir(parents=True, exist_ok=True)
 
         # Setup pip cache directory
-        self.pip_cache_dir = packages_dir.parent / "pip-cache"
+        # Use HOME/.cache/pip if available (standard XDG location), otherwise fallback to /tmp
+        # This prevents permission conflicts when multiple agents share the same pip cache
+        home_dir = Path(os.environ.get("HOME", "/tmp"))
+        self.pip_cache_dir = home_dir / ".cache" / "pip"
         self.pip_cache_dir.mkdir(parents=True, exist_ok=True)
     
     def load_package(self, apkg_path: Path, agent_app_id: Optional[str] = None) -> AgentPackage:
@@ -99,8 +102,15 @@ class PackageLoader:
                 if final_path.exists():
                     logger.warning("Package already exists, replacing", package_id=package_id)
                     shutil.rmtree(final_path)
-                
-                shutil.move(temp_dir, str(final_path))
+
+                try:
+                    shutil.move(temp_dir, str(final_path))
+                except PermissionError as e:
+                    raise PackageLoadError(
+                        f"Permission denied when moving package to {final_path}. "
+                        f"This usually indicates {self.packages_dir} has incorrect permissions. "
+                        f"Ensure it exists with mode 1777 (drwxrwxrwt). Original error: {e}"
+                    ) from e
 
                 # Create or reuse virtual environment
                 venv_path = self._ensure_venv(package_id, final_path, agent_app_id)
