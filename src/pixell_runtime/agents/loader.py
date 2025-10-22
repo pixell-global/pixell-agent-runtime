@@ -43,7 +43,10 @@ class PackageLoader:
         self.venvs_dir.mkdir(parents=True, exist_ok=True)
 
         # Setup pip cache directory
-        self.pip_cache_dir = packages_dir.parent / "pip-cache"
+        # Use HOME/.cache/pip if available (standard XDG location), otherwise fallback to /tmp
+        # This prevents permission conflicts when multiple agents share the same pip cache
+        home_dir = Path(os.environ.get("HOME", "/tmp"))
+        self.pip_cache_dir = home_dir / ".cache" / "pip"
         self.pip_cache_dir.mkdir(parents=True, exist_ok=True)
     
     def load_package(self, apkg_path: Path, agent_app_id: Optional[str] = None) -> AgentPackage:

@@ -187,7 +187,9 @@ class ProcessManager:
                 with zf.open('agent.yaml') as f:
                     manifest = yaml.safe_load(f)
                     package_id = f"{manifest['name']}@{manifest['version']}"
-                    extracted_dir = Path("/tmp/pixell_packages") / package_id
+                    # Use same shared extraction directory as supervisor
+                    packages_extract_dir = Path("/tmp/pixell_packages")
+                    extracted_dir = packages_extract_dir / package_id
 
                     # If directory exists, fix ownership
                     if extracted_dir.exists():
