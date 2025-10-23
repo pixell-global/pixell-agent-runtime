@@ -236,8 +236,8 @@ COMMAND_ID=$(aws ssm send-command \
 \"echo '[4/6] Installing new wheel...'\",
 \"sudo pip3.11 install /tmp/'$WHEEL_FILENAME'\",
 \"echo '[5/6] Updating supervisor configuration...'\",
-\"sudo sed -i 's/^PORT=.*/SUPERVISOR_PORT=8080/' /etc/par-supervisor.conf\",
-\"echo 'Updated SUPERVISOR_PORT to 8080'\",
+\"sudo sed -i 's/^PORT=.*/SUPERVISOR_PORT=9000/' /etc/par-supervisor.conf\",
+\"echo 'Updated SUPERVISOR_PORT to 9000'\",
 \"cat /etc/par-supervisor.conf | grep SUPERVISOR_PORT\",
 \"echo '[6/6] Restarting supervisor service...'\",
 \"sudo systemctl daemon-reload\",
@@ -334,13 +334,13 @@ if [ "$HEALTH_IP" = "N/A" ]; then
     log_warn "No public IP, using private IP: $HEALTH_IP"
 fi
 
-if curl -sf "http://$HEALTH_IP:8080/health" > /dev/null 2>&1; then
+if curl -sf "http://$HEALTH_IP:9000/health" > /dev/null 2>&1; then
     log_info "✅ External health check passed"
     log_info "Health response:"
-    curl -s "http://$HEALTH_IP:8080/health" | python3 -m json.tool || true
+    curl -s "http://$HEALTH_IP:9000/health" | python3 -m json.tool || true
 else
     log_warn "❌ Cannot reach supervisor from outside (this is normal if instance has no public IP)"
-    log_info "Supervisor should be accessible from within the VPC at: http://$INSTANCE_IP:8080/health"
+    log_info "Supervisor should be accessible from within the VPC at: http://$INSTANCE_IP:9000/health"
 fi
 
 echo ""
@@ -353,7 +353,7 @@ log_info "  Instance ID: $INSTANCE_ID"
 log_info "  Private IP: $INSTANCE_IP"
 log_info "  Public IP: $PUBLIC_IP"
 log_info "  Region: $AWS_REGION"
-log_info "  Supervisor Port: 8080"
+log_info "  Supervisor Port: 9000"
 echo ""
 log_warn "⚠️  NEXT STEP: Register instance in PAC database"
 log_info "Run this command from PAC repository:"
@@ -377,13 +377,13 @@ echo "  aws ssm start-session --target $INSTANCE_ID --region $AWS_REGION"
 echo "  sudo journalctl -u par-supervisor -f"
 echo ""
 log_info "Test health endpoint (from VPC):"
-echo "  curl http://$INSTANCE_IP:8080/health"
+echo "  curl http://$INSTANCE_IP:9000/health"
 echo ""
 log_info "List agents:"
-echo "  curl http://$INSTANCE_IP:8080/agents"
+echo "  curl http://$INSTANCE_IP:9000/agents"
 echo ""
 log_info "Get supervisor status:"
-echo "  curl http://$INSTANCE_IP:8080/status"
+echo "  curl http://$INSTANCE_IP:9000/status"
 echo ""
 log_info "=========================================="
 log_info "Test Agent Deployment"
@@ -391,7 +391,7 @@ log_info "=========================================="
 echo ""
 log_info "Deploy a test agent:"
 cat << 'EOF'
-  curl -X POST http://$INSTANCE_IP:8080/agents \
+  curl -X POST http://$INSTANCE_IP:9000/agents \
     -H "Content-Type: application/json" \
     -d '{
       "agent_app_id": "test-agent-001",
