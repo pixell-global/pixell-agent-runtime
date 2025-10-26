@@ -22,6 +22,13 @@ def main():
     # Get configuration from environment
     host = os.getenv("SUPERVISOR_HOST", "0.0.0.0")
     port = int(os.getenv("SUPERVISOR_PORT", "9000"))
+    max_agents = int(os.getenv("PAR_MAX_AGENTS", "200"))
+
+    # Port configuration (matching PAC's allocation scheme)
+    gateway_port = 50051  # External access via ALB
+    a2a_port_start = int(os.getenv("PAR_A2A_PORT_START", "60000"))
+    rest_port_start = int(os.getenv("PAR_REST_PORT_START", "63000"))
+    ui_port_start = int(os.getenv("PAR_UI_PORT_START", "65000"))
 
     logger.info(
         "Supervisor configuration",
@@ -29,7 +36,22 @@ def main():
         port=port,
         package_cache_dir=os.getenv("PACKAGE_CACHE_DIR", "/var/lib/pixell/packages"),
         package_extract_dir=os.getenv("PACKAGE_EXTRACT_DIR", "/var/lib/pixell/extracted"),
-        max_agents=os.getenv("MAX_AGENTS", "20"),
+        max_agents=max_agents,
+    )
+
+    logger.info(
+        "gRPC Gateway configuration",
+        gateway_port=gateway_port,
+        note="Gateway routes /agents/{id}/a2a/* to agent A2A ports"
+    )
+
+    logger.info(
+        "Agent port allocation scheme (PAC-managed)",
+        a2a_range=f"{a2a_port_start}-{a2a_port_start + max_agents - 1}",
+        rest_range=f"{rest_port_start}-{rest_port_start + max_agents - 1}",
+        ui_range=f"{ui_port_start}-{ui_port_start + max_agents - 1}",
+        max_agents=max_agents,
+        note="PAC allocates ports from database, PAR uses provided ports"
     )
 
     # Import and run uvicorn

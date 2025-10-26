@@ -1,5 +1,24 @@
-"""Port allocation for agent services."""
+"""Port allocation for agent services.
 
+⚠️  DEPRECATION NOTICE ⚠️
+This module is LEGACY and should only be used for backward compatibility.
+
+PAC (Pixell Agent Cloud) now manages port allocation centrally via database-backed allocation.
+When deploying agents, PAC allocates ports BEFORE calling PAR and sends them in the deploy request.
+
+PAR should:
+1. Use ports provided by PAC in DeployRequest.ports (primary path)
+2. Fall back to this allocator ONLY if PAC doesn't provide ports (legacy path)
+
+Port lifecycle is managed by PAC:
+- PAC allocates ports from database before deploy
+- PAC releases ports in database when agent deleted
+- PAR should NOT release ports (PAC owns the lifecycle)
+
+See: /Users/syum/dev/pixell-agent-cloud/src/lib/ports/allocator.ts for PAC implementation.
+"""
+
+import os
 import structlog
 from typing import Optional
 from pixell_runtime.supervisor.models import Ports
@@ -8,37 +27,64 @@ logger = structlog.get_logger()
 
 
 class PortAllocator:
-    """Allocates ports for agent REST/A2A/UI services.
+    """Allocates ports for agent REST/A2A/UI services (LEGACY - use PAC allocation).
 
-    Port ranges:
-    - REST: 8081-8100 (20 agents max)
-    - A2A:  50052-50071 (20 agents max)
-    - UI:   3001-3020 (20 agents max)
+    Port ranges (matching PAC's scheme):
+    - A2A (gRPC):  60000-60199 (200 agents max)
+    - REST API:    63000-63199 (200 agents max)
+    - UI Server:   65000-65199 (200 agents max)
 
-    Note: Port 8080 (REST), 50051 (A2A), 3000 (UI) are reserved for supervisor itself.
+    Note: These ranges match PAC's database-backed allocation scheme.
+    Port 50051 is reserved for the gRPC gateway.
+
+    Environment Variables:
+    - PAR_MAX_AGENTS: Maximum number of agents per instance (default: 200)
+    - PAR_A2A_PORT_START: A2A port range start (default: 60000)
+    - PAR_REST_PORT_START: REST port range start (default: 63000)
+    - PAR_UI_PORT_START: UI port range start (default: 65000)
     """
 
-    # Port ranges
-    REST_PORT_START = 8081
-    REST_PORT_END = 8100
-    A2A_PORT_START = 50052
-    A2A_PORT_END = 50071
-    UI_PORT_START = 3001
-    UI_PORT_END = 3020
+    # Maximum agents per instance (configurable via environment)
+    _MAX_AGENTS = int(os.getenv("PAR_MAX_AGENTS", "200"))
+
+    # Port ranges (matching PAC's allocation scheme)
+    # These are configurable via environment for testing/customization
+    A2A_PORT_START = int(os.getenv("PAR_A2A_PORT_START", "60000"))
+    A2A_PORT_END = A2A_PORT_START + _MAX_AGENTS - 1  # 60000-60199
+
+    REST_PORT_START = int(os.getenv("PAR_REST_PORT_START", "63000"))
+    REST_PORT_END = REST_PORT_START + _MAX_AGENTS - 1  # 63000-63199
+
+    UI_PORT_START = int(os.getenv("PAR_UI_PORT_START", "65000"))
+    UI_PORT_END = UI_PORT_START + _MAX_AGENTS - 1  # 65000-65199
 
     def __init__(self):
-        """Initialize port allocator with empty allocation tracking."""
+        """Initialize port allocator with empty allocation tracking.
+
+        ⚠️  DEPRECATION WARNING: This allocator is LEGACY.
+        PAC should provide ports in deploy requests instead.
+        """
         # Track allocated ports: agent_app_id -> Ports
         self.allocations: dict[str, Ports] = {}
-        logger.info("PortAllocator initialized", max_agents=self.max_agents())
+
+        logger.warning(
+            "PortAllocator initialized (LEGACY MODE - PAC should provide ports)",
+            max_agents=self.max_agents(),
+            a2a_range=f"{self.A2A_PORT_START}-{self.A2A_PORT_END}",
+            rest_range=f"{self.REST_PORT_START}-{self.REST_PORT_END}",
+            ui_range=f"{self.UI_PORT_START}-{self.UI_PORT_END}",
+            note="This allocator should only be used for backward compatibility"
+        )
 
     def max_agents(self) -> int:
         """Get maximum number of agents that can be allocated.
 
         Returns:
-            Maximum number of agents (20)
+            Maximum number of agents (default: 200, configurable via PAR_MAX_AGENTS)
         """
+        # Verify all port ranges can accommodate max agents
         return min(
+            self._MAX_AGENTS,
             self.REST_PORT_END - self.REST_PORT_START + 1,
             self.A2A_PORT_END - self.A2A_PORT_START + 1,
             self.UI_PORT_END - self.UI_PORT_START + 1,
@@ -67,7 +113,11 @@ class PortAllocator:
         return self.allocations.get(agent_app_id)
 
     def allocate(self, agent_app_id: str, reuse: bool = True) -> Ports:
-        """Allocate ports for an agent.
+        """Allocate ports for an agent (LEGACY - PAC should provide ports).
+
+        ⚠️  WARNING: This is a legacy fallback path.
+        PAC should allocate ports in database and send them in DeployRequest.ports.
+        This method should only be used for backward compatibility or testing.
 
         Args:
             agent_app_id: Agent identifier
@@ -79,6 +129,12 @@ class PortAllocator:
         Raises:
             RuntimeError: If no ports available or allocation fails
         """
+        logger.warning(
+            "Using LEGACY port allocation - PAC should provide ports instead",
+            agent_app_id=agent_app_id,
+            note="Consider upgrading PAC to use centralized database-backed allocation"
+        )
+
         # Check if already allocated
         if agent_app_id in self.allocations:
             if reuse:

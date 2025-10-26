@@ -2,13 +2,14 @@
 
 import asyncio
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import grpc
 import structlog
 from concurrent import futures
 
 from pixell_runtime.core.models import AgentPackage
+from pixell_runtime.a2a.interceptor import PARRoutingInterceptor
 
 logger = structlog.get_logger()
 
@@ -101,7 +102,8 @@ class AgentServiceImpl:
                 result=str(result),
                 error=error,
                 request_id=request_id,
-                duration_ms=duration_ms
+                duration_ms=duration_ms,
+                metadata={}  # Empty metadata for custom handlers (they can add their own)
             )
 
         except Exception as e:
@@ -113,7 +115,8 @@ class AgentServiceImpl:
                 result="",
                 error=str(e),
                 request_id=request_id,
-                duration_ms=duration_ms
+                duration_ms=duration_ms,
+                metadata={}  # Empty metadata on error
             )
     
     async def Ping(self, request, context):
@@ -261,7 +264,12 @@ def _load_agent_service(package: AgentPackage) -> tuple:
         return None, "none", None
 
 
-def create_grpc_server(package: Optional[AgentPackage] = None, port: int = 50052, agent_a2a_port: Optional[int] = None) -> grpc.aio.Server:
+def create_grpc_server(
+    package: Optional[AgentPackage] = None,
+    port: int = 50052,
+    agent_a2a_port: Optional[int] = None,
+    agent_id: Optional[str] = None
+) -> grpc.aio.Server:
     """Create and configure gRPC server.
 
     Supports three agent patterns:
@@ -273,6 +281,7 @@ def create_grpc_server(package: Optional[AgentPackage] = None, port: int = 50052
         package: Optional agent package with a2a service
         port: Port to bind the server to (default: 50052)
         agent_a2a_port: Port for forwarding to agent's subprocess gRPC server (Pattern 3)
+        agent_id: Agent app ID for path-based routing interceptor (NEW)
 
     Returns:
         Configured gRPC server
@@ -285,8 +294,29 @@ def create_grpc_server(package: Optional[AgentPackage] = None, port: int = 50052
         sys.path.insert(0, str(pkg_dir))
     from pixell_runtime.proto import agent_pb2_grpc
 
-    # Create server
-    server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
+    # Build interceptor chain
+    interceptors: List[grpc.aio.ServerInterceptor] = []
+
+    if agent_id:
+        # Add PAR routing interceptor (MUST be first in chain!)
+        routing_interceptor = PARRoutingInterceptor(agent_id=agent_id)
+        interceptors.append(routing_interceptor)
+        logger.info(
+            "Added PAR routing interceptor",
+            agent_id=agent_id,
+            prefix=routing_interceptor.prefix
+        )
+    else:
+        logger.warning(
+            "No agent_id provided - routing interceptor not added. "
+            "ALB path-based routing will not work!"
+        )
+
+    # Create server with interceptors
+    server = grpc.aio.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        interceptors=interceptors if interceptors else None
+    )
 
     # Load agent's service (if package provides one)
     agent_service, pattern, handlers = _load_agent_service(package)

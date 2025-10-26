@@ -45,6 +45,7 @@ class ProcessManager:
         package_path: Path,
         ports: Ports,
         env: Optional[Dict[str, str]] = None,
+        package_env: Optional[Dict[str, str]] = None,
     ) -> int:
         """Spawn an agent process as a specific Linux user.
 
@@ -53,7 +54,8 @@ class ProcessManager:
             linux_user: Linux username to run as
             package_path: Path to agent package (APKG)
             ports: Ports allocation for the agent
-            env: Additional environment variables
+            env: Additional environment variables from DeployRequest (highest priority)
+            package_env: Environment variables from agent.yaml + deploy.json (medium priority)
 
         Returns:
             Process ID (PID)
@@ -90,9 +92,23 @@ class ProcessManager:
             "HOME": home_dir,  # Set HOME for agent user (UV/pip need this for cache)
         }
 
-        # Add custom environment variables
+        # Add environment variables from agent.yaml + deploy.json (medium priority)
+        if package_env:
+            process_env.update(package_env)
+            logger.info(
+                "Added package environment variables",
+                agent_app_id=agent_app_id,
+                package_env_count=len(package_env)
+            )
+
+        # Add custom environment variables from DeployRequest (highest priority)
         if env:
             process_env.update(env)
+            logger.info(
+                "Added deployment environment variables",
+                agent_app_id=agent_app_id,
+                deploy_env_count=len(env)
+            )
 
         # Fix ownership of extracted package directory if it exists
         # This prevents permission errors when packages were extracted by a different user

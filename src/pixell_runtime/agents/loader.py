@@ -115,6 +115,22 @@ class PackageLoader:
                 # Create or reuse virtual environment
                 venv_path = self._ensure_venv(package_id, final_path, agent_app_id)
 
+                # Read deploy.json and merge environment variables
+                deploy_data = self._read_deploy_json(final_path)
+                deploy_env = deploy_data.get("environment", {})
+
+                # Merge environment: agent.yaml < deploy.json (deploy.json takes precedence)
+                merged_env = {**manifest.environment, **deploy_env}
+
+                if merged_env:
+                    logger.info(
+                        "Merged environment variables from agent.yaml and deploy.json",
+                        package_id=package_id,
+                        agent_yaml_vars=len(manifest.environment),
+                        deploy_json_vars=len(deploy_env),
+                        total_vars=len(merged_env)
+                    )
+
                 # Create package instance
                 package = AgentPackage(
                     id=package_id,
@@ -123,7 +139,8 @@ class PackageLoader:
                     url=f"https://local.pixell.runtime/packages/{package_id}",  # Use a placeholder URL
                     sha256=sha256,
                     status=AgentStatus.LOADING,
-                    venv_path=str(venv_path)  # Add venv path
+                    venv_path=str(venv_path),  # Add venv path
+                    environment=merged_env  # Add merged environment
                 )
 
                 logger.info("Package loaded successfully", package_id=package_id, venv=venv_path.name)
@@ -185,6 +202,22 @@ class PackageLoader:
                     logger.warning("No agent_app_id or venv path provided for directory load, creating venv")
                     venv_path = self._ensure_venv(package_id, package_dir, agent_app_id)
 
+            # Read deploy.json and merge environment variables
+            deploy_data = self._read_deploy_json(package_dir)
+            deploy_env = deploy_data.get("environment", {})
+
+            # Merge environment: agent.yaml < deploy.json (deploy.json takes precedence)
+            merged_env = {**manifest.environment, **deploy_env}
+
+            if merged_env:
+                logger.info(
+                    "Merged environment variables from agent.yaml and deploy.json",
+                    package_id=package_id,
+                    agent_yaml_vars=len(manifest.environment),
+                    deploy_json_vars=len(deploy_env),
+                    total_vars=len(merged_env)
+                )
+
             # Create package instance (no SHA256 since we don't have the original APKG file)
             package = AgentPackage(
                 id=package_id,
@@ -193,7 +226,8 @@ class PackageLoader:
                 url=f"https://local.pixell.runtime/packages/{package_id}",
                 sha256="",  # Not available for directory loads
                 status=AgentStatus.LOADING,
-                venv_path=str(venv_path)
+                venv_path=str(venv_path),
+                environment=merged_env  # Add merged environment
             )
 
             logger.info("Package loaded from directory", package_id=package_id, venv=venv_path.name)
@@ -293,8 +327,44 @@ class PackageLoader:
             dependencies=manifest_data.get("dependencies", []),
             a2a=a2a_config,
             rest=rest_config,
-            ui=ui_config
+            ui=ui_config,
+            environment=manifest_data.get("environment", {})
         )
+
+    def _read_deploy_json(self, package_path: Path) -> Dict[str, Any]:
+        """Read deploy.json from extracted package.
+
+        Args:
+            package_path: Path to extracted package directory
+
+        Returns:
+            Dictionary containing deploy.json data, or empty dict if file doesn't exist
+        """
+        deploy_json_path = package_path / "deploy.json"
+
+        if not deploy_json_path.exists():
+            logger.debug("No deploy.json found in package", path=str(package_path))
+            return {}
+
+        try:
+            with open(deploy_json_path) as f:
+                deploy_data = json.load(f)
+            logger.info("Loaded deploy.json from package", path=str(deploy_json_path))
+            return deploy_data
+        except json.JSONDecodeError as e:
+            logger.warning(
+                "Failed to parse deploy.json, skipping",
+                path=str(deploy_json_path),
+                error=str(e)
+            )
+            return {}
+        except Exception as e:
+            logger.warning(
+                "Error reading deploy.json, skipping",
+                path=str(deploy_json_path),
+                error=str(e)
+            )
+            return {}
 
     def _safe_extract_zip(self, zf: zipfile.ZipFile, dest_dir: Path):
         """Safely extract a zipfile to dest_dir, preventing zip-slip.

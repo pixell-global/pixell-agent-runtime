@@ -1,7 +1,9 @@
 """Supervisor state management for agent deployments."""
 
 import asyncio
+import json
 import os
+import yaml
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict
@@ -136,6 +138,61 @@ class SupervisorState:
         if self._zombie_reaper_task is None or self._zombie_reaper_task.done():
             self._zombie_reaper_task = asyncio.create_task(self._reap_zombies_task())
             logger.info("Started zombie reaper background task")
+
+    def _extract_package_environment(self, package_path: Path) -> Dict[str, str]:
+        """Extract environment variables from agent.yaml and deploy.json.
+
+        Args:
+            package_path: Path to extracted package directory
+
+        Returns:
+            Merged environment variables (deploy.json overrides agent.yaml)
+        """
+        agent_env = {}
+        deploy_env = {}
+
+        # Read agent.yaml
+        agent_yaml_path = package_path / "agent.yaml"
+        if agent_yaml_path.exists():
+            try:
+                with open(agent_yaml_path) as f:
+                    agent_data = yaml.safe_load(f)
+                    agent_env = agent_data.get("environment", {})
+                    logger.debug(
+                        "Loaded environment from agent.yaml",
+                        path=str(agent_yaml_path),
+                        env_count=len(agent_env)
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to load environment from agent.yaml",
+                    path=str(agent_yaml_path),
+                    error=str(e)
+                )
+
+        # Read deploy.json
+        deploy_json_path = package_path / "deploy.json"
+        if deploy_json_path.exists():
+            try:
+                with open(deploy_json_path) as f:
+                    deploy_data = json.load(f)
+                    deploy_env = deploy_data.get("environment", {})
+                    logger.debug(
+                        "Loaded environment from deploy.json",
+                        path=str(deploy_json_path),
+                        env_count=len(deploy_env)
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to load environment from deploy.json",
+                    path=str(deploy_json_path),
+                    error=str(e)
+                )
+
+        # Merge: agent.yaml < deploy.json (deploy.json takes precedence)
+        merged_env = {**agent_env, **deploy_env}
+
+        return merged_env
 
     def _cleanup_process_manager_state(self, agent_app_id: str, pid: Optional[int]) -> None:
         """Clean up process manager state for dead/zombie processes.
@@ -502,13 +559,25 @@ class SupervisorState:
 
             logger.info("Downloaded package", agent_app_id=agent_app_id, path=str(package_path))
 
-            # Step 4: Spawn agent process
+            # Step 4: Extract environment variables from agent.yaml and deploy.json
+            package_env = self._extract_package_environment(package_path)
+
+            if package_env:
+                logger.info(
+                    "Extracted environment variables from package",
+                    agent_app_id=agent_app_id,
+                    env_var_count=len(package_env),
+                    env_vars=list(package_env.keys())
+                )
+
+            # Step 5: Spawn agent process with environment
             pid = self.process_manager.spawn_agent(
                 agent_app_id=agent_app_id,
                 linux_user=username,
                 package_path=package_path,
                 ports=ports,
                 env=request.env,
+                package_env=package_env,
             )
             agent_process.pid = pid
             agent_process.started_at = datetime.now()

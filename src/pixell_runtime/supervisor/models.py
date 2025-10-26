@@ -18,10 +18,18 @@ class AgentStatus(str, Enum):
 
 
 class Ports(BaseModel):
-    """Port allocation for an agent."""
-    rest: int = Field(..., ge=8081, le=8100, description="REST API port (8081-8100)")
-    a2a: int = Field(..., ge=50052, le=50071, description="gRPC A2A port (50052-50071)")
-    ui: int = Field(..., ge=3001, le=3020, description="UI server port (3001-3020)")
+    """Port allocation for an agent.
+
+    PAC allocates ports in these ranges (per instance, 200-agent capacity):
+    - A2A (gRPC):  60000-60199 (slot_number + 60000)
+    - REST API:    63000-63199 (slot_number + 63000)
+    - UI Server:   65000-65199 (slot_number + 65000)
+
+    Note: Port constraints removed - PAC manages port ranges.
+    """
+    rest: int = Field(..., ge=1024, le=65535, description="REST API port")
+    a2a: int = Field(..., ge=1024, le=65535, description="gRPC A2A port")
+    ui: int = Field(..., ge=1024, le=65535, description="UI server port")
 
 
 class DeployRequest(BaseModel):
@@ -35,9 +43,25 @@ class DeployRequest(BaseModel):
     version: str = Field(..., description="Package version (required by PAC)")
     org_id: str = Field(..., description="Organization ID (required by PAC)")
 
+    # Short IDs for Linux username generation (avoid hyphens and length limits)
+    org_short_id: Optional[str] = Field(None, description="Organization short ID (16 chars, e.g., 'x8f2k9m4n7p1q3r5')")
+    agent_short_id: Optional[str] = Field(None, description="Agent short ID (8 chars, e.g., 'a7b2c9d4')")
+
+    # Port allocation from PAC (database-backed)
+    # If provided, PAR uses these ports. If null, PAR falls back to internal allocation.
+    # PAC sends: {"rest": 63001, "a2a": 60001, "ui": 65001}
+    ports: Optional[Ports] = Field(
+        None,
+        description="Port allocation from PAC. If provided, PAR uses these ports. "
+                    "If null, PAR falls back to internal allocation (backward compat)."
+    )
+
+    # Idempotency control
+    allow_update: bool = Field(True, description="If true, update agent if already exists with different deployment_id")
+
     # Optional configuration
     max_package_size_mb: int = Field(100, description="Maximum package size in MB")
-    boot_budget_ms: int = Field(5000, description="Boot time budget in milliseconds")
+    boot_budget_ms: int = Field(120000, description="Boot time budget in milliseconds (2 minutes)")
     boot_hard_limit_multiplier: float = Field(2.0, description="Hard limit multiplier for boot time")
     graceful_shutdown_timeout_sec: int = Field(30, description="Graceful shutdown timeout in seconds")
 
@@ -69,7 +93,7 @@ class DeleteRequest(BaseModel):
     """Request to delete an agent."""
     agent_app_id: str = Field(..., description="Agent identifier")
     force: bool = Field(False, description="Force delete even if agent is running")
-    cleanup_user: bool = Field(True, description="Delete Linux user after stopping agent")
+    cleanup_user: bool = Field(False, description="Delete Linux user after stopping agent (default: False, user is preserved for fast redeployment)")
 
 
 class AgentProcess(BaseModel):
