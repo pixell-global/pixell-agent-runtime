@@ -6,7 +6,7 @@ import os
 import yaml
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Union
 import structlog
 
 from pixell_runtime.supervisor.models import (
@@ -139,7 +139,7 @@ class SupervisorState:
             self._zombie_reaper_task = asyncio.create_task(self._reap_zombies_task())
             logger.info("Started zombie reaper background task")
 
-    def _extract_package_environment(self, package_path: Path) -> Dict[str, str]:
+    def _extract_package_environment(self, package_path: Union[Path, str]) -> Dict[str, str]:
         """Extract environment variables from agent.yaml and deploy.json.
 
         Args:
@@ -148,6 +148,10 @@ class SupervisorState:
         Returns:
             Merged environment variables (deploy.json overrides agent.yaml)
         """
+        # Ensure package_path is a Path object (handles both Path and str)
+        if isinstance(package_path, str):
+            package_path = Path(package_path)
+
         agent_env = {}
         deploy_env = {}
 
@@ -682,6 +686,16 @@ class SupervisorState:
             if request.graceful_shutdown_timeout_sec is not None:
                 agent_process.config["graceful_shutdown_timeout_sec"] = request.graceful_shutdown_timeout_sec
 
+            # Extract environment variables from agent.yaml and deploy.json
+            package_env = self._extract_package_environment(package_path)
+
+            if package_env:
+                logger.info(
+                    "Extracted environment variables from package",
+                    agent_app_id=agent_app_id,
+                    package_env_count=len(package_env),
+                )
+
             # Spawn new process
             pid = self.process_manager.spawn_agent(
                 agent_app_id=agent_app_id,
@@ -689,6 +703,7 @@ class SupervisorState:
                 package_path=Path(package_path),
                 ports=agent_process.ports,
                 env=request.env or {},
+                package_env=package_env,
             )
             agent_process.pid = pid
             agent_process.started_at = datetime.now()
