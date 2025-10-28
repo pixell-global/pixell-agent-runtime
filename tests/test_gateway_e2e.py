@@ -11,6 +11,7 @@ import pytest
 import asyncio
 import grpc
 from grpc import aio
+from pathlib import Path
 from unittest.mock import Mock, patch
 from datetime import datetime
 
@@ -40,7 +41,8 @@ async def mock_supervisor_state():
 
     mock_port_allocator = Mock(spec=PortAllocator)
     mock_package_downloader = Mock(spec=PackageDownloader)
-    mock_package_downloader.download = Mock(return_value="/tmp/test.apkg")
+    mock_package_downloader.download = Mock(return_value=Path("/tmp/test.apkg"))
+    mock_package_downloader.extract_package = Mock(return_value=Path("/tmp/extracted/test"))
 
     mock_process_manager = Mock(spec=ProcessManager)
     mock_process_manager.spawn_agent = Mock(return_value=12345)
@@ -52,6 +54,9 @@ async def mock_supervisor_state():
         package_downloader=mock_package_downloader,
         process_manager=mock_process_manager
     )
+
+    # Mock _extract_package_environment to avoid file system operations
+    state._extract_package_environment = Mock(return_value={})
 
     return state
 
