@@ -563,8 +563,55 @@ class SupervisorState:
 
             logger.info("Downloaded package", agent_app_id=agent_app_id, path=str(package_path))
 
+            # Step 3.5: Extract .apkg (ZIP) to directory (Issue #18 fix)
+            # PAR needs to extract the ZIP before reading config files like deploy.json
+            extracted_dir = self.package_downloader.extract_package(
+                package_path,
+                package_sha256=request.package_sha256,
+            )
+
+            logger.info(
+                "Extracted package",
+                agent_app_id=agent_app_id,
+                extracted_dir=str(extracted_dir)
+            )
+
+            # Step 3.6: Inject PAC environment into deploy.json (if provided)
+            if request.env:
+                deploy_json_path = extracted_dir / "deploy.json"
+
+                # Read existing deploy.json from extracted package
+                existing_deploy = {}
+                if deploy_json_path.exists():
+                    try:
+                        with open(deploy_json_path) as f:
+                            existing_deploy = json.load(f)
+                    except json.JSONDecodeError as e:
+                        logger.warning(
+                            "Failed to parse existing deploy.json, using empty config",
+                            agent_app_id=agent_app_id,
+                            error=str(e)
+                        )
+
+                # Merge: existing config + PAC environment (PAC takes precedence)
+                deploy_config = {
+                    **existing_deploy,
+                    "environment": request.env
+                }
+
+                # Write merged config back to deploy.json
+                with open(deploy_json_path, 'w') as f:
+                    json.dump(deploy_config, f, indent=2)
+
+                logger.info(
+                    "Injected PAC environment into deploy.json",
+                    agent_app_id=agent_app_id,
+                    env_var_count=len(request.env),
+                    env_var_keys=list(request.env.keys())
+                )
+
             # Step 4: Extract environment variables from agent.yaml and deploy.json
-            package_env = self._extract_package_environment(package_path)
+            package_env = self._extract_package_environment(extracted_dir)
 
             if package_env:
                 logger.info(
@@ -578,7 +625,7 @@ class SupervisorState:
             pid = self.process_manager.spawn_agent(
                 agent_app_id=agent_app_id,
                 linux_user=username,
-                package_path=package_path,
+                package_path=extracted_dir,
                 ports=ports,
                 env=request.env,
                 package_env=package_env,
@@ -665,6 +712,53 @@ class SupervisorState:
 
             logger.info("Downloaded new package", agent_app_id=agent_app_id)
 
+            # Extract .apkg (ZIP) to directory (Issue #18 fix)
+            extracted_dir = self.package_downloader.extract_package(
+                package_path,
+                package_sha256=request.package_sha256,
+                force_extract=True,  # Force re-extraction for updates
+            )
+
+            logger.info(
+                "Extracted new package",
+                agent_app_id=agent_app_id,
+                extracted_dir=str(extracted_dir)
+            )
+
+            # Inject PAC environment into deploy.json (if provided)
+            if request.env:
+                deploy_json_path = extracted_dir / "deploy.json"
+
+                # Read existing deploy.json from extracted package
+                existing_deploy = {}
+                if deploy_json_path.exists():
+                    try:
+                        with open(deploy_json_path) as f:
+                            existing_deploy = json.load(f)
+                    except json.JSONDecodeError as e:
+                        logger.warning(
+                            "Failed to parse existing deploy.json, using empty config",
+                            agent_app_id=agent_app_id,
+                            error=str(e)
+                        )
+
+                # Merge: existing config + PAC environment (PAC takes precedence)
+                deploy_config = {
+                    **existing_deploy,
+                    "environment": request.env
+                }
+
+                # Write merged config back to deploy.json
+                with open(deploy_json_path, 'w') as f:
+                    json.dump(deploy_config, f, indent=2)
+
+                logger.info(
+                    "Injected PAC environment into deploy.json",
+                    agent_app_id=agent_app_id,
+                    env_var_count=len(request.env),
+                    env_var_keys=list(request.env.keys())
+                )
+
             # Stop old process
             if self.process_manager.is_running(agent_app_id):
                 self.process_manager.stop_agent(agent_app_id)
@@ -687,7 +781,7 @@ class SupervisorState:
                 agent_process.config["graceful_shutdown_timeout_sec"] = request.graceful_shutdown_timeout_sec
 
             # Extract environment variables from agent.yaml and deploy.json
-            package_env = self._extract_package_environment(package_path)
+            package_env = self._extract_package_environment(extracted_dir)
 
             if package_env:
                 logger.info(
@@ -700,7 +794,7 @@ class SupervisorState:
             pid = self.process_manager.spawn_agent(
                 agent_app_id=agent_app_id,
                 linux_user=agent_process.linux_user,
-                package_path=Path(package_path),
+                package_path=extracted_dir,
                 ports=agent_process.ports,
                 env=request.env or {},
                 package_env=package_env,
