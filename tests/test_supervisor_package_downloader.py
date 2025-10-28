@@ -2,6 +2,7 @@
 
 import pytest
 import tempfile
+import zipfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -267,3 +268,237 @@ def test_cache_key_different_urls(temp_cache_dir):
     key2 = downloader._get_cache_key(url2, None)
 
     assert key1 != key2
+
+
+# Tests for extract_package() method (Issue #18)
+
+@pytest.fixture
+def temp_extracted_dir():
+    """Create temporary extracted directory for tests."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir)
+
+
+@pytest.fixture
+def sample_apkg(temp_cache_dir):
+    """Create a sample .apkg (ZIP) file for testing."""
+    apkg_path = temp_cache_dir / "test-package.apkg"
+
+    # Create a valid ZIP file with agent.yaml and deploy.json
+    with zipfile.ZipFile(apkg_path, 'w') as zf:
+        zf.writestr("agent.yaml", "name: test-agent\nversion: 1.0.0\n")
+        zf.writestr("deploy.json", '{"environment": {"TEST_VAR": "test_value"}}')
+        zf.writestr("requirements.txt", "requests==2.28.0\n")
+
+    return apkg_path
+
+
+def test_extract_package_success(temp_cache_dir, temp_extracted_dir, sample_apkg):
+    """Test successful package extraction."""
+    downloader = PackageDownloader(
+        cache_dir=temp_cache_dir,
+        extracted_dir=temp_extracted_dir
+    )
+
+    sha256 = "abc123def456"
+    extracted_dir = downloader.extract_package(sample_apkg, package_sha256=sha256)
+
+    # Verify extraction directory created
+    assert extracted_dir.exists()
+    assert extracted_dir.is_dir()
+
+    # Verify files extracted
+    assert (extracted_dir / "agent.yaml").exists()
+    assert (extracted_dir / "deploy.json").exists()
+    assert (extracted_dir / "requirements.txt").exists()
+
+    # Verify content
+    agent_yaml = (extracted_dir / "agent.yaml").read_text()
+    assert "test-agent" in agent_yaml
+
+
+def test_extract_package_reuse_cached(temp_cache_dir, temp_extracted_dir, sample_apkg):
+    """Test extraction reuses cached extracted directory."""
+    downloader = PackageDownloader(
+        cache_dir=temp_cache_dir,
+        extracted_dir=temp_extracted_dir
+    )
+
+    sha256 = "abc123def456"
+
+    # First extraction
+    extracted_dir1 = downloader.extract_package(sample_apkg, package_sha256=sha256)
+    assert extracted_dir1.exists()
+
+    # Add marker file to verify reuse
+    marker_file = extracted_dir1 / "marker.txt"
+    marker_file.write_text("first extraction")
+
+    # Second extraction with same SHA256 - should reuse
+    extracted_dir2 = downloader.extract_package(sample_apkg, package_sha256=sha256)
+
+    # Should return same directory
+    assert extracted_dir2 == extracted_dir1
+
+    # Marker should still exist (not re-extracted)
+    assert marker_file.exists()
+    assert marker_file.read_text() == "first extraction"
+
+
+def test_extract_package_force_extract(temp_cache_dir, temp_extracted_dir, sample_apkg):
+    """Test force_extract re-extracts even if cached."""
+    downloader = PackageDownloader(
+        cache_dir=temp_cache_dir,
+        extracted_dir=temp_extracted_dir
+    )
+
+    sha256 = "abc123def456"
+
+    # First extraction
+    extracted_dir1 = downloader.extract_package(sample_apkg, package_sha256=sha256)
+
+    # Add marker file
+    marker_file = extracted_dir1 / "marker.txt"
+    marker_file.write_text("old marker")
+
+    # Force re-extraction
+    extracted_dir2 = downloader.extract_package(
+        sample_apkg,
+        package_sha256=sha256,
+        force_extract=True
+    )
+
+    # Should return same directory path
+    assert extracted_dir2 == extracted_dir1
+
+    # Marker should NOT exist (re-extracted)
+    assert not marker_file.exists()
+
+
+def test_extract_package_incomplete_cached(temp_cache_dir, temp_extracted_dir, sample_apkg):
+    """Test extraction re-extracts if cached directory is incomplete."""
+    downloader = PackageDownloader(
+        cache_dir=temp_cache_dir,
+        extracted_dir=temp_extracted_dir
+    )
+
+    sha256 = "abc123def456"
+    cache_key = sha256[:16]
+    incomplete_dir = temp_extracted_dir / cache_key
+
+    # Create incomplete extracted directory (missing agent.yaml)
+    incomplete_dir.mkdir(parents=True)
+    (incomplete_dir / "some_file.txt").write_text("incomplete")
+
+    # Extract - should detect incomplete and re-extract
+    extracted_dir = downloader.extract_package(sample_apkg, package_sha256=sha256)
+
+    # Should have agent.yaml now (complete extraction)
+    assert (extracted_dir / "agent.yaml").exists()
+    assert (extracted_dir / "deploy.json").exists()
+
+
+def test_extract_package_without_sha256(temp_cache_dir, temp_extracted_dir, sample_apkg):
+    """Test extraction works without SHA256 (uses file hash)."""
+    downloader = PackageDownloader(
+        cache_dir=temp_cache_dir,
+        extracted_dir=temp_extracted_dir
+    )
+
+    # Extract without providing SHA256
+    extracted_dir = downloader.extract_package(sample_apkg)
+
+    # Should still work
+    assert extracted_dir.exists()
+    assert (extracted_dir / "agent.yaml").exists()
+
+
+def test_extract_package_invalid_zip(temp_cache_dir, temp_extracted_dir):
+    """Test extraction fails gracefully for invalid ZIP file."""
+    downloader = PackageDownloader(
+        cache_dir=temp_cache_dir,
+        extracted_dir=temp_extracted_dir
+    )
+
+    # Create invalid ZIP file
+    invalid_apkg = temp_cache_dir / "invalid.apkg"
+    invalid_apkg.write_text("This is not a ZIP file")
+
+    # Should raise ValueError
+    with pytest.raises(ValueError, match="not a valid ZIP"):
+        downloader.extract_package(invalid_apkg)
+
+
+def test_extract_package_missing_file(temp_cache_dir, temp_extracted_dir):
+    """Test extraction fails for non-existent file."""
+    downloader = PackageDownloader(
+        cache_dir=temp_cache_dir,
+        extracted_dir=temp_extracted_dir
+    )
+
+    missing_apkg = temp_cache_dir / "missing.apkg"
+
+    # Should raise ValueError
+    with pytest.raises(ValueError, match="not found"):
+        downloader.extract_package(missing_apkg)
+
+
+def test_extract_package_zipslip_absolute_path(temp_cache_dir, temp_extracted_dir):
+    """Test extraction rejects absolute paths (zip-slip protection)."""
+    downloader = PackageDownloader(
+        cache_dir=temp_cache_dir,
+        extracted_dir=temp_extracted_dir
+    )
+
+    # Create malicious ZIP with absolute path
+    malicious_apkg = temp_cache_dir / "malicious.apkg"
+    with zipfile.ZipFile(malicious_apkg, 'w') as zf:
+        zf.writestr("agent.yaml", "name: evil\n")
+        # Try to write to absolute path (zip-slip attack)
+        zf.writestr("/etc/passwd", "evil content")
+
+    # Should raise ValueError
+    with pytest.raises(ValueError, match="Zip-slip"):
+        downloader.extract_package(malicious_apkg)
+
+
+def test_extract_package_zipslip_parent_traversal(temp_cache_dir, temp_extracted_dir):
+    """Test extraction rejects parent directory traversal (zip-slip protection)."""
+    downloader = PackageDownloader(
+        cache_dir=temp_cache_dir,
+        extracted_dir=temp_extracted_dir
+    )
+
+    # Create malicious ZIP with parent traversal
+    malicious_apkg = temp_cache_dir / "malicious.apkg"
+    with zipfile.ZipFile(malicious_apkg, 'w') as zf:
+        zf.writestr("agent.yaml", "name: evil\n")
+        # Try to escape extraction directory
+        zf.writestr("../../../etc/passwd", "evil content")
+
+    # Should raise ValueError
+    with pytest.raises(ValueError, match="Zip-slip"):
+        downloader.extract_package(malicious_apkg)
+
+
+def test_extract_package_cleanup_on_failure(temp_cache_dir, temp_extracted_dir):
+    """Test extraction cleans up partial extraction on failure."""
+    downloader = PackageDownloader(
+        cache_dir=temp_cache_dir,
+        extracted_dir=temp_extracted_dir
+    )
+
+    # Create invalid ZIP that will fail during extraction
+    invalid_apkg = temp_cache_dir / "invalid.apkg"
+    invalid_apkg.write_text("corrupted zip data")
+
+    sha256 = "test_cleanup_123"
+
+    # Attempt extraction - should fail
+    with pytest.raises(ValueError):
+        downloader.extract_package(invalid_apkg, package_sha256=sha256)
+
+    # Verify extraction directory was cleaned up
+    cache_key = sha256[:16]
+    extract_dir = temp_extracted_dir / cache_key
+    assert not extract_dir.exists()
