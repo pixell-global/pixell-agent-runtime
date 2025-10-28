@@ -1,6 +1,7 @@
 """A2A gRPC server implementation."""
 
 import asyncio
+import json
 import time
 from typing import Any, Dict, Optional, List
 
@@ -53,28 +54,149 @@ class AgentServiceImpl:
         return capabilities
     
     async def Invoke(self, request, context):
-        """Invoke an action by forwarding to agent's gRPC server."""
+        """Invoke action - supports both A2A and legacy formats.
+
+        Parses both:
+        1. A2A format: request.message.params_json → message.metadata.skill/params
+        2. Legacy format: request.action/parameters
+
+        For subprocess forwarding, normalizes to legacy format to ensure
+        all agents receive consistent format.
+        """
         from pixell_runtime.proto import agent_pb2, agent_pb2_grpc
 
         start_time = time.time()
-        request_id = request.request_id or f"req_{int(time.time() * 1000)}"
+        action = None
+        parameters = {}
+        request_id = None
 
+        # Parse request format - try A2A first, then legacy
+        try:
+            # Try A2A format first (request.message)
+            if request.HasField("message"):
+                # Parse A2A JSON-RPC 2.0 format
+                a2a_msg = request.message
+                request_id = a2a_msg.id
+
+                logger.debug(
+                    "Received A2A format request",
+                    jsonrpc=a2a_msg.jsonrpc,
+                    method=a2a_msg.method,
+                    request_id=request_id
+                )
+
+                # Parse params_json to extract action and parameters
+                params_data = json.loads(a2a_msg.params_json)
+                message_data = params_data.get("message", {})
+                metadata = message_data.get("metadata", {})
+
+                action = metadata.get("skill")      # Extract from metadata.skill
+                parameters = metadata.get("params", {})
+
+                logger.info(
+                    "Parsed A2A format",
+                    action=action,
+                    has_parameters=bool(parameters),
+                    request_id=request_id
+                )
+
+            # Fall back to legacy format
+            else:
+                action = request.action
+                parameters = dict(request.parameters)
+                request_id = request.request_id or f"req_{int(time.time() * 1000)}"
+
+                logger.debug(
+                    "Received legacy format request",
+                    action=action,
+                    has_parameters=bool(parameters),
+                    request_id=request_id
+                )
+
+        except json.JSONDecodeError as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            error_msg = f"Invalid JSON in A2A params_json: {str(e)}"
+            logger.error("Failed to parse A2A format", error=error_msg, request_id=request_id)
+
+            return agent_pb2.ActionResult(
+                success=False,
+                result="",
+                error=error_msg,
+                request_id=request_id or f"req_{int(time.time() * 1000)}",
+                duration_ms=duration_ms,
+                metadata={}
+            )
+        except Exception as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            error_msg = f"Failed to parse request format: {str(e)}"
+            logger.error("Request parsing failed", error=error_msg, request_id=request_id)
+
+            return agent_pb2.ActionResult(
+                success=False,
+                result="",
+                error=error_msg,
+                request_id=request_id or f"req_{int(time.time() * 1000)}",
+                duration_ms=duration_ms,
+                metadata={}
+            )
+
+        # Validate we have an action
+        if not action:
+            duration_ms = int((time.time() - start_time) * 1000)
+            error_msg = "No action/skill specified in request"
+            logger.error("Missing action", request_id=request_id)
+
+            return agent_pb2.ActionResult(
+                success=False,
+                result="",
+                error=error_msg,
+                request_id=request_id or f"req_{int(time.time() * 1000)}",
+                duration_ms=duration_ms,
+                metadata={}
+            )
+
+        # Now dispatch to handlers based on parsed action
         try:
             # Check for custom handler first
-            if request.action in self.custom_handlers:
-                result = await self.custom_handlers[request.action](request.parameters)
+            if action in self.custom_handlers:
+                logger.info("Invoking custom handler", action=action, request_id=request_id)
+                result = await self.custom_handlers[action](parameters)
                 success = True
                 error = ""
+
             # If agent has its own gRPC server (subprocess mode), forward to it
             elif self.agent_a2a_port:
                 try:
+                    logger.info(
+                        "Forwarding to agent subprocess",
+                        action=action,
+                        port=self.agent_a2a_port,
+                        request_id=request_id
+                    )
+
+                    # CRITICAL: Normalize to legacy format before forwarding
+                    # This ensures all agents receive consistent format regardless
+                    # of whether the client sent A2A or legacy format
+                    legacy_request = agent_pb2.ActionRequest(
+                        action=action,
+                        parameters={k: str(v) for k, v in parameters.items()},
+                        request_id=request_id
+                    )
+
                     # Connect to agent's gRPC server
                     agent_address = f"localhost:{self.agent_a2a_port}"
                     async with grpc.aio.insecure_channel(agent_address) as channel:
                         stub = agent_pb2_grpc.AgentServiceStub(channel)
 
-                        # Forward the request to the agent
-                        agent_response = await stub.Invoke(request, timeout=30)
+                        # Forward the normalized legacy request to the agent
+                        agent_response = await stub.Invoke(legacy_request, timeout=30)
+
+                        logger.info(
+                            "Agent subprocess responded",
+                            action=action,
+                            success=agent_response.success,
+                            request_id=request_id
+                        )
 
                         # Return the agent's response
                         return agent_response
@@ -82,18 +204,25 @@ class AgentServiceImpl:
                 except Exception as forward_error:
                     logger.error(
                         "Failed to forward to agent gRPC server",
-                        action=request.action,
+                        action=action,
                         port=self.agent_a2a_port,
-                        error=str(forward_error)
+                        error=str(forward_error),
+                        request_id=request_id
                     )
                     result = ""
                     success = False
                     error = f"Failed to forward to agent: {str(forward_error)}"
             else:
                 # No custom handler and no agent gRPC server
+                logger.warning(
+                    "No handler found for action",
+                    action=action,
+                    request_id=request_id,
+                    available_handlers=list(self.custom_handlers.keys())
+                )
                 result = ""
                 success = False
-                error = f"No handler found for action: {request.action}"
+                error = f"No handler found for action: {action}"
 
             duration_ms = int((time.time() - start_time) * 1000)
 
@@ -108,7 +237,12 @@ class AgentServiceImpl:
 
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
-            logger.error("Action invocation failed", action=request.action, error=str(e))
+            logger.error(
+                "Action invocation failed",
+                action=action,
+                error=str(e),
+                request_id=request_id
+            )
 
             return agent_pb2.ActionResult(
                 success=False,
