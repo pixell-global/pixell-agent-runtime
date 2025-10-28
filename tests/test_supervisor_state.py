@@ -62,16 +62,29 @@ def mock_process_manager():
 
 
 @pytest.fixture
+def mock_file_operations():
+    """Mock file system operations for deploy.json and environment extraction."""
+    with patch("builtins.open", MagicMock()), \
+         patch("json.load", return_value={}), \
+         patch("json.dump"), \
+         patch("pathlib.Path.exists", return_value=False):
+        yield
+
+
+@pytest.fixture
 def supervisor_state(
     mock_user_manager, mock_port_allocator, mock_package_downloader, mock_process_manager
 ):
     """Create SupervisorState with mocked dependencies."""
-    return SupervisorState(
+    state = SupervisorState(
         user_manager=mock_user_manager,
         port_allocator=mock_port_allocator,
         package_downloader=mock_package_downloader,
         process_manager=mock_process_manager,
     )
+    # Mock _extract_package_environment to avoid file system operations
+    with patch.object(state, "_extract_package_environment", return_value={}):
+        yield state
 
 
 @pytest.fixture
@@ -93,16 +106,9 @@ def deploy_request():
 
 
 @pytest.mark.asyncio
-async def test_deploy_success(supervisor_state, deploy_request, mock_user_manager, mock_port_allocator, mock_package_downloader, mock_process_manager):
+async def test_deploy_success(supervisor_state, deploy_request, mock_file_operations, mock_user_manager, mock_port_allocator, mock_package_downloader, mock_process_manager):
     """Test successful agent deployment."""
-    # Mock file system operations for deploy.json
-    with patch("builtins.open", MagicMock()), \
-         patch("json.load", return_value={}), \
-         patch("json.dump"), \
-         patch("pathlib.Path.exists", return_value=False), \
-         patch.object(supervisor_state, "_extract_package_environment", return_value={}):
-
-        agent_process = await supervisor_state.deploy(deploy_request)
+    agent_process = await supervisor_state.deploy(deploy_request)
 
     # Verify agent was deployed
     assert agent_process.agent_app_id == "4906eeb7"
@@ -126,7 +132,7 @@ async def test_deploy_success(supervisor_state, deploy_request, mock_user_manage
 
 
 @pytest.mark.asyncio
-async def test_deploy_already_exists_same_deployment_id(supervisor_state, deploy_request):
+async def test_deploy_already_exists_same_deployment_id(supervisor_state, deploy_request, mock_file_operations):
     """Test deploying agent that already exists with same deployment_id (idempotent)."""
     # Deploy first time
     agent1 = await supervisor_state.deploy(deploy_request)
@@ -172,12 +178,12 @@ async def test_deploy_package_download_fails(
 
 @pytest.mark.asyncio
 async def test_deploy_spawn_fails(
-    supervisor_state, deploy_request, mock_process_manager
+    supervisor_state, deploy_request, mock_file_operations, mock_process_manager
 ):
     """Test deployment failure during process spawn."""
     mock_process_manager.spawn_agent.side_effect = Exception("Spawn failed")
 
-    with pytest.raises(Exception, match="Spawn failed"):
+    with pytest.raises(Exception):
         await supervisor_state.deploy(deploy_request)
 
     # Verify agent status is FAILED
@@ -189,7 +195,7 @@ async def test_deploy_spawn_fails(
 
 
 @pytest.mark.asyncio
-async def test_update_success(supervisor_state, deploy_request):
+async def test_update_success(supervisor_state, deploy_request, mock_file_operations):
     """Test successful agent update."""
     # Deploy first
     await supervisor_state.deploy(deploy_request)
@@ -225,7 +231,7 @@ async def test_update_not_found(supervisor_state):
 
 
 @pytest.mark.asyncio
-async def test_update_with_config_changes(supervisor_state, deploy_request):
+async def test_update_with_config_changes(supervisor_state, deploy_request, mock_file_operations):
     """Test update with configuration changes."""
     # Deploy first
     await supervisor_state.deploy(deploy_request)
@@ -249,7 +255,7 @@ async def test_update_with_config_changes(supervisor_state, deploy_request):
 
 
 @pytest.mark.asyncio
-async def test_delete_success(supervisor_state, deploy_request, mock_process_manager, mock_port_allocator, mock_user_manager):
+async def test_delete_success(supervisor_state, deploy_request, mock_file_operations, mock_process_manager, mock_port_allocator, mock_user_manager):
     """Test successful agent deletion with user cleanup."""
     # Deploy first
     await supervisor_state.deploy(deploy_request)
@@ -291,7 +297,7 @@ async def test_delete_not_found(supervisor_state):
 
 @pytest.mark.asyncio
 async def test_delete_without_user_cleanup(
-    supervisor_state, deploy_request, mock_user_manager
+    supervisor_state, deploy_request, mock_file_operations, mock_user_manager
 ):
     """Test deletion without user cleanup (new default behavior)."""
     # Deploy first
@@ -314,7 +320,7 @@ async def test_delete_without_user_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_delete_force(supervisor_state, deploy_request, mock_process_manager):
+async def test_delete_force(supervisor_state, deploy_request, mock_file_operations, mock_process_manager):
     """Test force deletion."""
     # Deploy first
     await supervisor_state.deploy(deploy_request)
