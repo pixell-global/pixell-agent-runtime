@@ -104,7 +104,7 @@ class A2AClient:
             return grpc.aio.insecure_channel(external_endpoint)
 
         # Last resort: try localhost (for local development)
-        a2a_port = os.getenv('A2A_PORT', '50052')
+        a2a_port = os.getenv('A2A_PORT', '60000')
         localhost_endpoint = f"localhost:{a2a_port}"
         logger.warning("No Service Discovery or external endpoint, using localhost",
                       endpoint=localhost_endpoint)

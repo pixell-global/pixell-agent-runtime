@@ -153,7 +153,7 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
             try:
                 # Use actual A2A port from environment (set by runtime/deployer)
                 import os
-                a2a_port = int(os.getenv("A2A_PORT", "50052"))
+                a2a_port = int(os.getenv("A2A_PORT", "60000"))
                 async with grpc_aio.insecure_channel(f"localhost:{a2a_port}") as channel:
                     stub = agent_pb2_grpc.AgentServiceStub(channel)
                     await stub.Health(agent_pb2.Empty(), timeout=0.5)
@@ -349,7 +349,7 @@ def setup_builtin_endpoints(router: APIRouter, package: Optional[AgentPackage] =
         if package and package.manifest.a2a:
             try:
                 import os
-                a2a_port = int(os.getenv("A2A_PORT", "50052"))
+                a2a_port = int(os.getenv("A2A_PORT", "60000"))
                 async with grpc_aio.insecure_channel(f"localhost:{a2a_port}") as channel:
                     stub = agent_pb2_grpc.AgentServiceStub(channel)
                     # Use a short timeout so health doesn't hang if gRPC isn't ready

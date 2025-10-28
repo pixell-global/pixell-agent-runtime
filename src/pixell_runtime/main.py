@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
     if runtime_mode == "multi-agent":
         try:
             from pixell_runtime.a2a.router import create_router_server, start_router_server
-            a2a_port = int(os.getenv("A2A_PORT", "50052"))
+            a2a_port = int(os.getenv("A2A_PORT", "60000"))
 
             # Check if Envoy is present (Envoy has ENVOY_ADMIN_URL set)
             # If Envoy is present, bind to localhost only (internal routing)

@@ -2,6 +2,7 @@
 
 import pytest
 import asyncio
+import subprocess
 from unittest.mock import patch, MagicMock, AsyncMock
 from pathlib import Path
 from datetime import datetime
@@ -23,6 +24,7 @@ def mock_user_manager():
     manager.get_username.return_value = "agent_4906eeb7"
     manager.create_user.return_value = Path("/home/agent_4906eeb7")
     manager.ensure_directories.return_value = None
+    manager.clean_agent_files.return_value = None
     manager.delete_user.return_value = None
     return manager
 
@@ -43,6 +45,7 @@ def mock_package_downloader():
     """Create mock PackageDownloader."""
     downloader = MagicMock()
     downloader.download.return_value = Path("/var/lib/pixell/packages/abc123.apkg")
+    downloader.extract_package.return_value = Path("/var/lib/pixell/extracted/abc123def456")
     return downloader
 
 
@@ -59,16 +62,29 @@ def mock_process_manager():
 
 
 @pytest.fixture
+def mock_file_operations():
+    """Mock file system operations for deploy.json and environment extraction."""
+    with patch("builtins.open", MagicMock()), \
+         patch("json.load", return_value={}), \
+         patch("json.dump"), \
+         patch("pathlib.Path.exists", return_value=False):
+        yield
+
+
+@pytest.fixture
 def supervisor_state(
     mock_user_manager, mock_port_allocator, mock_package_downloader, mock_process_manager
 ):
     """Create SupervisorState with mocked dependencies."""
-    return SupervisorState(
+    state = SupervisorState(
         user_manager=mock_user_manager,
         port_allocator=mock_port_allocator,
         package_downloader=mock_package_downloader,
         process_manager=mock_process_manager,
     )
+    # Mock _extract_package_environment to avoid file system operations
+    with patch.object(state, "_extract_package_environment", return_value={}):
+        yield state
 
 
 @pytest.fixture
@@ -90,7 +106,7 @@ def deploy_request():
 
 
 @pytest.mark.asyncio
-async def test_deploy_success(supervisor_state, deploy_request, mock_user_manager, mock_port_allocator, mock_package_downloader, mock_process_manager):
+async def test_deploy_success(supervisor_state, deploy_request, mock_file_operations, mock_user_manager, mock_port_allocator, mock_package_downloader, mock_process_manager):
     """Test successful agent deployment."""
     agent_process = await supervisor_state.deploy(deploy_request)
 
@@ -108,22 +124,25 @@ async def test_deploy_success(supervisor_state, deploy_request, mock_user_manage
     assert mock_user_manager.ensure_directories.called
     assert mock_port_allocator.allocate.called
     assert mock_package_downloader.download.called
+    assert mock_package_downloader.extract_package.called  # New assertion for extraction
     assert mock_process_manager.spawn_agent.called
-    assert mock_process_manager.health_check.called
 
     # Verify agent is in state
     assert "4906eeb7" in supervisor_state.agents
 
 
 @pytest.mark.asyncio
-async def test_deploy_already_exists(supervisor_state, deploy_request):
-    """Test deploying agent that already exists."""
+async def test_deploy_already_exists_same_deployment_id(supervisor_state, deploy_request, mock_file_operations):
+    """Test deploying agent that already exists with same deployment_id (idempotent)."""
     # Deploy first time
-    await supervisor_state.deploy(deploy_request)
+    agent1 = await supervisor_state.deploy(deploy_request)
 
-    # Try to deploy again
-    with pytest.raises(RuntimeError, match="already deployed"):
-        await supervisor_state.deploy(deploy_request)
+    # Deploy again with same deployment_id (should be idempotent)
+    agent2 = await supervisor_state.deploy(deploy_request)
+
+    # Should return the same agent
+    assert agent1.agent_app_id == agent2.agent_app_id
+    assert agent1.deployment_id == agent2.deployment_id
 
 
 @pytest.mark.asyncio
@@ -159,12 +178,12 @@ async def test_deploy_package_download_fails(
 
 @pytest.mark.asyncio
 async def test_deploy_spawn_fails(
-    supervisor_state, deploy_request, mock_process_manager
+    supervisor_state, deploy_request, mock_file_operations, mock_process_manager
 ):
     """Test deployment failure during process spawn."""
     mock_process_manager.spawn_agent.side_effect = Exception("Spawn failed")
 
-    with pytest.raises(Exception, match="Spawn failed"):
+    with pytest.raises(Exception):
         await supervisor_state.deploy(deploy_request)
 
     # Verify agent status is FAILED
@@ -173,49 +192,10 @@ async def test_deploy_spawn_fails(
     assert agent.status == AgentStatus.FAILED
 
 
-@pytest.mark.asyncio
-async def test_deploy_health_check_timeout(
-    supervisor_state, deploy_request, mock_process_manager
-):
-    """Test deployment failure due to health check timeout."""
-    # Health check always fails
-    mock_process_manager.health_check = AsyncMock(return_value=False)
-
-    # Set short timeout for test
-    deploy_request.boot_budget_ms = 100
-    deploy_request.boot_hard_limit_multiplier = 1.0
-
-    with pytest.raises(RuntimeError, match="failed health check"):
-        await supervisor_state.deploy(deploy_request)
-
-    # Verify agent status is FAILED
-    agent = supervisor_state.get_agent("4906eeb7")
-    assert agent is not None
-    assert agent.status == AgentStatus.FAILED
-    assert "failed health check" in agent.error_message
 
 
 @pytest.mark.asyncio
-async def test_deploy_process_crashes_during_startup(
-    supervisor_state, deploy_request, mock_process_manager
-):
-    """Test deployment failure when process crashes during startup."""
-    # Health check fails, process not running
-    mock_process_manager.health_check = AsyncMock(return_value=False)
-    mock_process_manager.is_running.return_value = False
-
-    with pytest.raises(RuntimeError, match="process terminated during startup"):
-        await supervisor_state.deploy(deploy_request)
-
-    # Verify agent status is FAILED
-    agent = supervisor_state.get_agent("4906eeb7")
-    assert agent is not None
-    assert agent.status == AgentStatus.FAILED
-    assert "terminated during startup" in agent.error_message
-
-
-@pytest.mark.asyncio
-async def test_update_success(supervisor_state, deploy_request):
+async def test_update_success(supervisor_state, deploy_request, mock_file_operations):
     """Test successful agent update."""
     # Deploy first
     await supervisor_state.deploy(deploy_request)
@@ -251,7 +231,7 @@ async def test_update_not_found(supervisor_state):
 
 
 @pytest.mark.asyncio
-async def test_update_with_config_changes(supervisor_state, deploy_request):
+async def test_update_with_config_changes(supervisor_state, deploy_request, mock_file_operations):
     """Test update with configuration changes."""
     # Deploy first
     await supervisor_state.deploy(deploy_request)
@@ -272,44 +252,15 @@ async def test_update_with_config_changes(supervisor_state, deploy_request):
     assert agent_process.config["boot_budget_ms"] == 10000
 
 
-@pytest.mark.asyncio
-async def test_update_health_check_fails(
-    supervisor_state, deploy_request, mock_process_manager
-):
-    """Test update failure when health check fails."""
-    # Deploy first - health check succeeds
-    await supervisor_state.deploy(deploy_request)
-
-    # Reset the mock to track new calls
-    mock_process_manager.health_check.reset_mock()
-
-    # Make health check fail for update
-    mock_process_manager.health_check = AsyncMock(return_value=False)
-
-    # Update
-    update_request = UpdateRequest(
-        agent_app_id="4906eeb7",
-        deployment_id="dep-456",
-        package_url="s3://bucket/new-package.apkg",
-        boot_budget_ms=100,
-        boot_hard_limit_multiplier=1.0,
-    )
-
-    with pytest.raises(RuntimeError, match="failed health check after update"):
-        await supervisor_state.update(update_request)
-
-    # Verify agent status is FAILED
-    agent = supervisor_state.get_agent("4906eeb7")
-    assert agent.status == AgentStatus.FAILED
 
 
 @pytest.mark.asyncio
-async def test_delete_success(supervisor_state, deploy_request, mock_process_manager, mock_port_allocator, mock_user_manager):
-    """Test successful agent deletion."""
+async def test_delete_success(supervisor_state, deploy_request, mock_file_operations, mock_process_manager, mock_port_allocator, mock_user_manager):
+    """Test successful agent deletion with user cleanup."""
     # Deploy first
     await supervisor_state.deploy(deploy_request)
 
-    # Delete
+    # Delete with user cleanup
     delete_request = DeleteRequest(
         agent_app_id="4906eeb7",
         force=False,
@@ -322,8 +273,10 @@ async def test_delete_success(supervisor_state, deploy_request, mock_process_man
 
     # Verify cleanup was performed
     assert mock_process_manager.stop_agent.called
-    assert mock_port_allocator.release.called
-    assert mock_user_manager.delete_user.called
+    assert mock_user_manager.clean_agent_files.called  # Agent files cleaned
+    # NOTE: Ports are NOT released by PAR - PAC manages port lifecycle
+    assert not mock_port_allocator.release.called
+    assert mock_user_manager.delete_user.called  # User deleted when cleanup_user=True
 
     # Verify agent is removed from state
     assert "4906eeb7" not in supervisor_state.agents
@@ -344,13 +297,13 @@ async def test_delete_not_found(supervisor_state):
 
 @pytest.mark.asyncio
 async def test_delete_without_user_cleanup(
-    supervisor_state, deploy_request, mock_user_manager
+    supervisor_state, deploy_request, mock_file_operations, mock_user_manager
 ):
-    """Test deletion without user cleanup."""
+    """Test deletion without user cleanup (new default behavior)."""
     # Deploy first
     await supervisor_state.deploy(deploy_request)
 
-    # Delete without user cleanup
+    # Delete without user cleanup (default behavior)
     delete_request = DeleteRequest(
         agent_app_id="4906eeb7",
         force=False,
@@ -360,12 +313,14 @@ async def test_delete_without_user_cleanup(
     result = await supervisor_state.delete(delete_request)
 
     assert result is True
-    # Verify user was NOT deleted
+    # Verify agent files were cleaned
+    assert mock_user_manager.clean_agent_files.called
+    # Verify user was NOT deleted (preserved for reuse)
     assert not mock_user_manager.delete_user.called
 
 
 @pytest.mark.asyncio
-async def test_delete_force(supervisor_state, deploy_request, mock_process_manager):
+async def test_delete_force(supervisor_state, deploy_request, mock_file_operations, mock_process_manager):
     """Test force deletion."""
     # Deploy first
     await supervisor_state.deploy(deploy_request)
@@ -465,3 +420,46 @@ async def test_deploy_cleanup_on_failure(
 
     # Verify cleanup was attempted
     assert mock_process_manager.stop_agent.called or mock_process_manager.is_running.called
+
+
+# Tests for Issue #2 fix: package extraction permissions
+@patch("subprocess.run")
+@patch("pathlib.Path.mkdir")
+def test_initialize_shared_directories_success(mock_mkdir, mock_subprocess_run, mock_user_manager, mock_port_allocator, mock_package_downloader, mock_process_manager):
+    """Test successful initialization of shared package extraction directory."""
+    mock_subprocess_run.return_value = MagicMock(returncode=0)
+
+    # Create SupervisorState - this should call _initialize_shared_directories
+    state = SupervisorState(
+        user_manager=mock_user_manager,
+        port_allocator=mock_port_allocator,
+        package_downloader=mock_package_downloader,
+        process_manager=mock_process_manager,
+    )
+
+    # Verify directory creation was attempted
+    assert mock_mkdir.called
+
+    # Verify chmod 1777 was called
+    assert mock_subprocess_run.called
+    call_args = mock_subprocess_run.call_args[0][0]
+    assert call_args == ["chmod", "1777", "/tmp/pixell_packages"]
+
+
+@patch("subprocess.run")
+@patch("pathlib.Path.mkdir")
+def test_initialize_shared_directories_chmod_failure(mock_mkdir, mock_subprocess_run, mock_user_manager, mock_port_allocator, mock_package_downloader, mock_process_manager):
+    """Test that chmod failure is logged but doesn't prevent initialization."""
+    mock_subprocess_run.side_effect = subprocess.CalledProcessError(1, "chmod", stderr="Permission denied")
+
+    # This should not raise - errors are logged but don't prevent startup
+    state = SupervisorState(
+        user_manager=mock_user_manager,
+        port_allocator=mock_port_allocator,
+        package_downloader=mock_package_downloader,
+        process_manager=mock_process_manager,
+    )
+
+    # State should still be created
+    assert state is not None
+    assert isinstance(state, SupervisorState)

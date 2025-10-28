@@ -69,7 +69,7 @@ EOF
 
 # Check if running from PAR repository root
 check_repo_root() {
-    if [ ! -f "setup.py" ] || [ ! -d "src/pixell_runtime" ]; then
+    if [ ! -f "pyproject.toml" ] || [ ! -d "src/pixell_runtime" ]; then
         log_error "Must run from PAR repository root"
         log_error "Current directory: $(pwd)"
         log_error "Expected: pixell-agent-runtime/"
@@ -155,6 +155,17 @@ fi
 WHEEL_FILENAME=$(basename "$WHEEL_FILE")
 log_info "✅ Built: $WHEEL_FILENAME"
 
+# Verify wheel version matches pyproject.toml
+EXPECTED_VERSION=$(grep '^version = ' pyproject.toml | cut -d'"' -f2)
+if [[ ! "$WHEEL_FILENAME" =~ $EXPECTED_VERSION ]]; then
+    log_error "Version mismatch detected!"
+    log_error "  pyproject.toml version: $EXPECTED_VERSION"
+    log_error "  Built wheel: $WHEEL_FILENAME"
+    log_error "This indicates the build system is not reading pyproject.toml correctly"
+    exit 1
+fi
+log_info "✅ Version verified: $EXPECTED_VERSION"
+
 # Step 3: Verify SSM connectivity
 log_step "3/7" "Verifying SSM connectivity..."
 
@@ -207,52 +218,35 @@ aws s3 cp "$WHEEL_FILE" "$S3_URL" --region "$AWS_REGION" || {
 log_info "✅ Wheel uploaded to $S3_URL"
 
 # Step 5: Install PAR on EC2 via SSM
-log_step "5/7" "Installing PAR supervisor on EC2 via SSM..."
+log_step "5/7" "Installing PAR on EC2..."
 
-# Execute installation via SSM using simple inline commands
-log_info "Executing installation commands via SSM..."
+# Execute installation directly via SSM (no separate script file)
 COMMAND_ID=$(aws ssm send-command \
     --region "$AWS_REGION" \
     --instance-ids "$INSTANCE_ID" \
     --document-name "AWS-RunShellScript" \
-    --parameters '{
-        "commands": [
-            "set -e",
-            "echo \"[1/7] Downloading wheel from S3...\"",
-            "aws s3 cp '"$S3_URL"' /tmp/'"$WHEEL_FILENAME"'",
-            "echo \"[2/7] Installing Python 3.11...\"",
-            "if ! command -v python3.11 &> /dev/null; then sudo yum install -y python3.11 python3.11-pip python3.11-devel; else echo \"  Python 3.11 already installed\"; fi",
-            "echo \"[3/7] Installing PAR wheel package...\"",
-            "sudo pip3.11 install --quiet /tmp/'"$WHEEL_FILENAME"'",
-            "echo \"[4/7] Creating configuration file...\"",
-            "sudo mkdir -p /etc/pixell",
-            "echo \"PORT=9000\" | sudo tee /etc/par-supervisor.conf > /dev/null",
-            "echo \"LOG_LEVEL=info\" | sudo tee -a /etc/par-supervisor.conf > /dev/null",
-            "echo \"MAX_AGENTS=20\" | sudo tee -a /etc/par-supervisor.conf > /dev/null",
-            "echo \"PACKAGE_DIR=/var/lib/pixell/packages\" | sudo tee -a /etc/par-supervisor.conf > /dev/null",
-            "echo \"EXTRACT_DIR=/var/lib/pixell/extracted\" | sudo tee -a /etc/par-supervisor.conf > /dev/null",
-            "echo \"AGENT_BASE_DIR=/var/lib/pixell/agents\" | sudo tee -a /etc/par-supervisor.conf > /dev/null",
-            "echo \"REST_PORT_RANGE=8081-8100\" | sudo tee -a /etc/par-supervisor.conf > /dev/null",
-            "echo \"A2A_PORT_RANGE=50052-50071\" | sudo tee -a /etc/par-supervisor.conf > /dev/null",
-            "echo \"UI_PORT_RANGE=3001-3020\" | sudo tee -a /etc/par-supervisor.conf > /dev/null",
-            "echo \"AWS_REGION='"$AWS_REGION"'\" | sudo tee -a /etc/par-supervisor.conf > /dev/null",
-            "echo \"[5/7] Creating systemd service...\"",
-            "sudo tee /etc/systemd/system/par-supervisor.service > /dev/null << 'EOFSERVICE'\n[Unit]\nDescription=Pixell Agent Runtime Supervisor\nAfter=network.target\n\n[Service]\nType=simple\nUser=root\nWorkingDirectory=/var/lib/pixell\nEnvironmentFile=/etc/par-supervisor.conf\nExecStart=/usr/bin/python3.11 -m pixell_runtime.supervisor\nRestart=always\nRestartSec=10\nStandardOutput=journal\nStandardError=journal\n\nReadWritePaths=/var/lib/pixell\nReadWritePaths=/home\nPrivateTmp=true\nNoNewPrivileges=false\nLimitNOFILE=65536\nLimitNPROC=4096\n\n[Install]\nWantedBy=multi-user.target\nEOFSERVICE",
-            "echo \"[6/7] Creating required directories...\"",
-            "sudo mkdir -p /var/lib/pixell/{packages,extracted,logs,agents}",
-            "sudo chmod 755 /var/lib/pixell /var/lib/pixell/packages /var/lib/pixell/extracted /var/lib/pixell/logs /var/lib/pixell/agents",
-            "echo \"[7/7] Starting PAR supervisor service...\"",
-            "sudo systemctl daemon-reload",
-            "sudo systemctl enable par-supervisor",
-            "sudo systemctl restart par-supervisor",
-            "echo \"Waiting for service to start...\"",
-            "sleep 5",
-            "if sudo systemctl is-active --quiet par-supervisor; then echo \"✅ Service started successfully\"; else echo \"❌ Service failed to start\"; sudo systemctl status par-supervisor --no-pager; exit 1; fi",
-            "echo \"Verifying local health check...\"",
-            "if curl -sf http://localhost:9000/health > /dev/null 2>&1; then echo \"✅ Local health check passed\"; curl -s http://localhost:9000/health; else echo \"❌ Local health check failed\"; sudo journalctl -u par-supervisor -n 50 --no-pager; exit 1; fi"
-        ]
-    }' \
-    --comment "Deploy PAR Supervisor" \
+    --parameters "{\"commands\":[
+\"set -e\",
+\"echo '[1/6] Downloading wheel from S3...'\",
+\"aws s3 cp '$S3_URL' /tmp/'$WHEEL_FILENAME' --region '$AWS_REGION'\",
+\"echo '[2/6] Installing Python 3.11 if needed...'\",
+\"sudo yum install -y python3.11 python3.11-pip python3.11-devel 2>/dev/null || echo 'Already installed'\",
+\"echo '[3/6] Uninstalling old version...'\",
+\"sudo pip3.11 uninstall -y pixell-runtime 2>/dev/null || echo 'No old version'\",
+\"echo '[4/6] Installing new wheel...'\",
+\"sudo pip3.11 install /tmp/'$WHEEL_FILENAME'\",
+\"echo '[5/6] Updating supervisor configuration...'\",
+\"sudo sed -i 's/^PORT=.*/SUPERVISOR_PORT=9000/' /etc/par-supervisor.conf\",
+\"echo 'Updated SUPERVISOR_PORT to 9000'\",
+\"cat /etc/par-supervisor.conf | grep SUPERVISOR_PORT\",
+\"echo '[6/6] Restarting supervisor service...'\",
+\"sudo systemctl daemon-reload\",
+\"sudo systemctl restart par-supervisor\",
+\"sleep 3\",
+\"sudo systemctl is-active par-supervisor && echo 'Service active' || echo 'Service failed'\",
+\"pip3.11 show pixell-runtime | grep Version\"
+]}" \
+    --comment "Install PAR $EXPECTED_VERSION" \
     --query 'Command.CommandId' \
     --output text)
 
@@ -300,8 +294,37 @@ fi
 
 log_info "✅ PAR supervisor installed on EC2"
 
-# Step 6: Verify external health check
-log_step "6/7" "Verifying external health check..."
+# Step 6: Verify installed version matches expected version
+log_step "6/7" "Verifying installed version..."
+VERIFY_CMD=$(aws ssm send-command \
+    --region "$AWS_REGION" \
+    --instance-ids "$INSTANCE_ID" \
+    --document-name "AWS-RunShellScript" \
+    --parameters '{"commands":["pip3.11 show pixell-runtime | grep Version"]}' \
+    --comment "Verify PAR version" \
+    --query 'Command.CommandId' \
+    --output text)
+
+sleep 3
+
+INSTALLED_VERSION=$(aws ssm get-command-invocation \
+    --region "$AWS_REGION" \
+    --command-id "$VERIFY_CMD" \
+    --instance-id "$INSTANCE_ID" \
+    --query 'StandardOutputContent' \
+    --output text | grep 'Version:' | awk '{print $2}' || echo "unknown")
+
+if [ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]; then
+    log_error "Installed version mismatch!"
+    log_error "  Expected: $EXPECTED_VERSION"
+    log_error "  Installed: $INSTALLED_VERSION"
+    log_error "Deployment succeeded but EC2 has wrong version"
+    exit 1
+fi
+log_info "✅ Installed version verified: $INSTALLED_VERSION"
+
+# Step 7: Verify external health check
+log_step "7/7" "Verifying external health check..."
 
 sleep 3
 
@@ -319,9 +342,6 @@ else
     log_warn "❌ Cannot reach supervisor from outside (this is normal if instance has no public IP)"
     log_info "Supervisor should be accessible from within the VPC at: http://$INSTANCE_IP:9000/health"
 fi
-
-# Step 7: Post-deployment information
-log_step "7/7" "Deployment complete!"
 
 echo ""
 log_info "=========================================="

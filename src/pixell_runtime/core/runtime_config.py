@@ -35,10 +35,12 @@ class RuntimeConfig:
         self.package_url: Optional[str] = None
         self.package_sha256: Optional[str] = None
         
-        # Ports
-        self.rest_port: int = 8080
-        self.a2a_port: int = 50051
-        self.ui_port: int = 3000
+        # Ports (matching PAC's allocation scheme)
+        # Default ports for direct agent access (supervisor will set actual allocated ports)
+        self.rest_port: int = 63000  # REST API (range: 63000-63199)
+        self.a2a_port: int = 60000   # A2A gRPC (range: 60000-60199)
+        self.ui_port: int = 65000    # UI Server (range: 65000-65199)
+        # Note: Gateway listens on 50051 for external access
         
         # AWS configuration
         self.aws_region: Optional[str] = None
@@ -100,8 +102,8 @@ class RuntimeConfig:
     
     def _validate_ports(self):
         """Validate port configuration."""
-        # REST_PORT
-        rest_port_str = os.getenv("REST_PORT", "8080")
+        # REST_PORT (PAC allocates from range 63000-63199)
+        rest_port_str = os.getenv("REST_PORT", "63000")
         try:
             rest_port = int(rest_port_str)
             if rest_port < 1 or rest_port > 65535:
@@ -116,9 +118,10 @@ class RuntimeConfig:
             self.errors.append(
                 f"REST_PORT must be a valid integer, got: {rest_port_str}"
             )
-        
-        # A2A_PORT
-        a2a_port_str = os.getenv("A2A_PORT", "50052")
+
+        # A2A_PORT (PAC allocates from range 60000-60199)
+        # Note: Gateway listens on 50051, agents use 60000-60199
+        a2a_port_str = os.getenv("A2A_PORT", "60000")
         try:
             a2a_port = int(a2a_port_str)
             if a2a_port < 1 or a2a_port > 65535:
@@ -134,8 +137,8 @@ class RuntimeConfig:
                 f"A2A_PORT must be a valid integer, got: {a2a_port_str}"
             )
         
-        # UI_PORT
-        ui_port_str = os.getenv("UI_PORT", "3000")
+        # UI_PORT (PAC allocates from range 65000-65199)
+        ui_port_str = os.getenv("UI_PORT", "65000")
         try:
             ui_port = int(ui_port_str)
             if ui_port < 1 or ui_port > 65535:
