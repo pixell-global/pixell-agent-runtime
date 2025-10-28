@@ -264,12 +264,16 @@ class PackageLoader:
         ui_config = None
         if "ui" in manifest_data:
             ui_data = manifest_data["ui"]
+            logger.info("Found UI configuration in manifest", ui_data=ui_data)
             if "path" not in ui_data or not ui_data.get("path"):
                 raise PackageValidationError("UI config missing required 'path'")
             ui_config = UIConfig(
                 path=ui_data.get("path"),
                 basePath=ui_data.get("basePath", "/")
             )
+            logger.info("Created UI config", ui_path=ui_config.path, ui_base_path=ui_config.basePath)
+        else:
+            logger.info("No UI configuration found in manifest")
         
         # Create manifest
         return AgentManifest(
@@ -462,7 +466,12 @@ class PackageLoader:
 
         if uv_available:
             # uv pip install syntax
-            install_cmd = ["uv", "pip", "install", "-r", str(req_file), "--python", str(venv_path / "bin" / "python")]
+            # Windows uses Scripts/python.exe, Unix uses bin/python
+            if sys.platform == "win32":
+                python_path = venv_path / "Scripts" / "python.exe"
+            else:
+                python_path = venv_path / "bin" / "python"
+            install_cmd = ["uv", "pip", "install", "-r", str(req_file), "--python", str(python_path)]
 
             if pip_index_url:
                 install_cmd.extend(["--index-url", pip_index_url])
@@ -626,7 +635,11 @@ class PackageLoader:
             venv.create(venv_path, with_pip=True, clear=True)
 
             # Optionally upgrade pip for production (skip by default to speed tests)
-            pip_path = venv_path / "bin" / "pip"
+            # Windows uses Scripts/pip.exe, Unix uses bin/pip
+            if sys.platform == "win32":
+                pip_path = venv_path / "Scripts" / "pip.exe"
+            else:
+                pip_path = venv_path / "bin" / "pip"
             if os.environ.get("PAR_UPGRADE_PIP", "false").lower() == "true":
                 logger.info("Upgrading pip in venv", venv=venv_name)
                 result = subprocess.run(
@@ -706,7 +719,11 @@ class PackageLoader:
 
             # Optionally install pixell-runtime into the venv (default: disabled; use PYTHONPATH)
             if os.environ.get("PAR_INSTALL_SELF_IN_VENV", "false").lower() == "true":
-                pip_path = venv_path / "bin" / "pip"
+                # Windows uses Scripts/pip.exe, Unix uses bin/pip
+                if sys.platform == "win32":
+                    pip_path = venv_path / "Scripts" / "pip.exe"
+                else:
+                    pip_path = venv_path / "bin" / "pip"
                 # Go from loader.py -> agents/ -> pixell_runtime/ -> src/ -> repo root
                 par_source_dir = Path(__file__).parent.parent.parent.parent  # /app (in Docker) or repo root
 

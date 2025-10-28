@@ -274,8 +274,18 @@ class ThreeSurfaceRuntime:
         self.rest_app = create_rest_app(self.package, base_path=self.base_path)
 
         # Setup UI routes if multiplexed
+        logger.info("Checking UI setup", 
+                   multiplexed=self.multiplexed,
+                   has_ui_config=bool(self.package.manifest.ui),
+                   package_id=self.package.id)
+        
         if self.multiplexed and self.package.manifest.ui:
+            logger.info("Setting up UI routes for multiplexed mode", package_id=self.package.id)
             setup_ui_routes(self.rest_app, self.package)
+        else:
+            logger.info("Skipping UI setup", 
+                       multiplexed=self.multiplexed,
+                       has_ui_config=bool(self.package.manifest.ui))
 
         # Start server
         config = uvicorn.Config(
