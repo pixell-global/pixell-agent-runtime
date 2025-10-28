@@ -45,6 +45,7 @@ def mock_package_downloader():
     """Create mock PackageDownloader."""
     downloader = MagicMock()
     downloader.download.return_value = Path("/var/lib/pixell/packages/abc123.apkg")
+    downloader.extract_package.return_value = Path("/var/lib/pixell/extracted/abc123def456")
     return downloader
 
 
@@ -94,7 +95,14 @@ def deploy_request():
 @pytest.mark.asyncio
 async def test_deploy_success(supervisor_state, deploy_request, mock_user_manager, mock_port_allocator, mock_package_downloader, mock_process_manager):
     """Test successful agent deployment."""
-    agent_process = await supervisor_state.deploy(deploy_request)
+    # Mock file system operations for deploy.json
+    with patch("builtins.open", MagicMock()), \
+         patch("json.load", return_value={}), \
+         patch("json.dump"), \
+         patch("pathlib.Path.exists", return_value=False), \
+         patch.object(supervisor_state, "_extract_package_environment", return_value={}):
+
+        agent_process = await supervisor_state.deploy(deploy_request)
 
     # Verify agent was deployed
     assert agent_process.agent_app_id == "4906eeb7"
@@ -110,6 +118,7 @@ async def test_deploy_success(supervisor_state, deploy_request, mock_user_manage
     assert mock_user_manager.ensure_directories.called
     assert mock_port_allocator.allocate.called
     assert mock_package_downloader.download.called
+    assert mock_package_downloader.extract_package.called  # New assertion for extraction
     assert mock_process_manager.spawn_agent.called
 
     # Verify agent is in state
