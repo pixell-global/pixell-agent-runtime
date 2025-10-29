@@ -16,7 +16,6 @@ authors = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -39,6 +38,9 @@ dependencies = [
     "asyncio>=3.4.3",
     "aiofiles>=23.2.1",
     "cryptography>=42.0.0",
+    "grpcio>=1.76.0",
+    "protobuf>=4.0.0",
+    "sqlalchemy>=2.0.44",
 ]
 
 [project.optional-dependencies]

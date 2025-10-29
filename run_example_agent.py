@@ -13,29 +13,30 @@ from pixell_runtime.three_surface.runtime import ThreeSurfaceRuntime
 
 async def main():
     """Run the example agent."""
-    apkg_path = Path("example-agent.apkg")
+    apkg_path = Path("vivid-commenter-v2-1.0.9.apkg")
     
     if not apkg_path.exists():
         print(f"Example agent package not found: {apkg_path}")
         print("Run 'python build_example_agent.py' first to build the package.")
         return
     
-    print("🚀 Starting Example Three-Surface Agent")
+    print("Starting Example Three-Surface Agent")
     print("=" * 50)
     print(f"Package: {apkg_path}")
     print("Surfaces:")
-    print("  📡 REST API: http://localhost:8080")
-    print("  🔗 A2A gRPC: localhost:50051")
-    print("  🎨 UI: http://localhost:8080/")
+    print("  REST API: http://localhost:8080")
+    print("  A2A gRPC: localhost:50051")
+    print("  UI: http://localhost:3000")
     print("=" * 50)
     print("Press Ctrl+C to stop")
     print()
     
     # Set environment variables
+    os.environ["AGENT_APP_ID"] = "example-agent-001"
     os.environ["REST_PORT"] = "8080"
     os.environ["A2A_PORT"] = "50051"
     os.environ["UI_PORT"] = "3000"
-    os.environ["MULTIPLEXED"] = "true"
+    os.environ["MULTIPLEXED"] = "false"
     
     # Create and start runtime
     runtime = ThreeSurfaceRuntime(str(apkg_path))
@@ -43,7 +44,7 @@ async def main():
     try:
         await runtime.start()
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
+        print("\nShutting down...")
     finally:
         await runtime.shutdown()
 
