@@ -32,9 +32,10 @@ class AgentExport(BaseModel):
 
 
 class A2AConfig(BaseModel):
-    """A2A (gRPC) configuration."""
+    """A2A configuration (supports both gRPC and HTTP)."""
     
     service: Optional[str] = Field(None, description="gRPC server entry (exports createGrpcServer())")
+    http_server: Optional[str] = Field(None, description="HTTP server entry (exports create_http_server() or main() that returns A2AStarletteApplication)")
 
 
 class RESTConfig(BaseModel):

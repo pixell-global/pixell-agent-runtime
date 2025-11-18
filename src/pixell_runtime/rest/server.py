@@ -227,43 +227,279 @@ def mount_agent_routes(app: Union[FastAPI, APIRouter], package: AgentPackage):
             module_path = rest_path
             function_name = "mount"
         
-        # Add package path to sys.path for imports
+        # IMPORTANT: Add venv site-packages FIRST, before package path
+        # This ensures that dependencies like a2a-sdk are found before
+        # the agent's own modules are imported
         import sys
         from pathlib import Path
         package_path = Path(package.path)
-        if str(package_path) not in sys.path:
-            sys.path.insert(0, str(package_path))
-
-        # Add venv site-packages to sys.path BEFORE importing agent modules
-        # This fixes ModuleNotFoundError for agent dependencies like sqlalchemy
+        
         if hasattr(package, 'venv_path') and package.venv_path:
-            venv_site_packages = (
-                Path(package.venv_path) / "lib" /
-                f"python{sys.version_info.major}.{sys.version_info.minor}" /
-                "site-packages"
-            )
-            if venv_site_packages.exists():
+            venv_path = Path(package.venv_path)
+            # Windows uses "Lib", Unix uses "lib"
+            lib_dir = "Lib" if sys.platform == "win32" else "lib"
+            
+            # Try two possible paths for site-packages:
+            # 1. Lib/site-packages (Windows venv standard)
+            # 2. Lib/pythonX.Y/site-packages (some venv configurations)
+            venv_site_packages = None
+            possible_paths = [
+                venv_path / lib_dir / "site-packages",
+                venv_path / lib_dir / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages",
+            ]
+            
+            for possible_path in possible_paths:
+                if possible_path.exists():
+                    venv_site_packages = possible_path
+                    break
+            
+            if venv_site_packages:
                 if str(venv_site_packages) not in sys.path:
                     sys.path.insert(0, str(venv_site_packages))
                     logger.info(
                         "Added venv site-packages to sys.path",
                         path=str(venv_site_packages)
                     )
+        
+        # Add package path to sys.path (after venv, so dependencies take precedence)
+        if str(package_path) not in sys.path:
+            sys.path.insert(0, str(package_path))
 
-        # Import and mount routes
-        module = __import__(module_path, fromlist=[function_name])
+        # Sanitize environment variables before importing agent module
+        # Some agent modules (like src/config.py) may try to convert env vars to int
+        # at module level, and "None" string will cause errors
+        import os
+        env_vars_to_sanitize = ["DB_PORT", "DB_HOST", "DB_NAME"]
+        
+        # Check for .env file in package directory and sanitize it
+        env_file = package_path / ".env"
+        if env_file.exists():
+            logger.debug("Found .env file in package, checking for invalid values", path=str(env_file))
+            try:
+                with open(env_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                
+                # Check if .env file contains invalid values
+                modified = False
+                new_lines = []
+                for line in lines:
+                    original_line = line
+                    line = line.strip()
+                    # Skip comments and empty lines
+                    if not line or line.startswith('#'):
+                        new_lines.append(original_line)
+                        continue
+                    
+                    # Parse KEY=VALUE format
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        
+                        # Remove quotes if present
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        elif value.startswith("'") and value.endswith("'"):
+                            value = value[1:-1]
+                        
+                        # Check if this is a variable we need to sanitize
+                        if key in env_vars_to_sanitize:
+                            value_lower = value.lower()
+                            if value_lower in ("none", "null") or value == "":
+                                # Comment out the line instead of removing it
+                                new_lines.append(f"# {original_line.strip()}  # Commented out by runtime: invalid value\n")
+                                modified = True
+                                logger.info(
+                                    "Commented out invalid value in .env file",
+                                    var_name=key,
+                                    original_value=value,
+                                    file=str(env_file)
+                                )
+                                continue
+                    
+                    new_lines.append(original_line)
+                
+                # Write back if modified
+                if modified:
+                    with open(env_file, 'w', encoding='utf-8') as f:
+                        f.writelines(new_lines)
+                    logger.info("Updated .env file to remove invalid values", file=str(env_file))
+            except Exception as e:
+                logger.warning("Failed to sanitize .env file", file=str(env_file), error=str(e))
+        
+        # Log current values before sanitization (check os.environ directly)
+        logger.debug(
+            "Checking environment variables before sanitization",
+            db_port=os.environ.get("DB_PORT"),
+            db_host=os.environ.get("DB_HOST"),
+            db_name=os.environ.get("DB_NAME")
+        )
+        
+        for var_name in env_vars_to_sanitize:
+            # Check os.environ directly to catch "None" strings
+            if var_name in os.environ:
+                value = os.environ[var_name]
+                if value is not None:
+                    value_stripped = str(value).strip()
+                    value_lower = value_stripped.lower()
+                    if value_lower in ("none", "null") or value_stripped == "":
+                        # Remove invalid values so default is used
+                        del os.environ[var_name]
+                        logger.info(
+                            "Removed invalid environment variable",
+                            var_name=var_name,
+                            original_value=value
+                        )
+        
+        # Log values after sanitization
+        logger.debug(
+            "Environment variables after sanitization",
+            db_port=os.environ.get("DB_PORT"),
+            db_host=os.environ.get("DB_HOST"),
+            db_name=os.environ.get("DB_NAME")
+        )
+
+        # Import and mount routes or app
+        # Note: load_dotenv() in config.py may set env vars during import,
+        # so we need to catch and handle that
+        # The problem is that Config class fields are evaluated at module level,
+        # so we can't clean env vars after import - we need to prevent the error
+        # by ensuring env vars are clean BEFORE Config class fields are evaluated
+        
+        # Try importing with multiple retries, cleaning env vars each time
+        max_retries = 3
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                # Clean env vars before each import attempt
+                for var_name in env_vars_to_sanitize:
+                    if var_name in os.environ:
+                        value = os.environ[var_name]
+                        value_stripped = str(value).strip()
+                        value_lower = value_stripped.lower()
+                        if value_lower in ("none", "null") or value_stripped == "":
+                            del os.environ[var_name]
+                            if attempt > 0:
+                                logger.debug(
+                                    "Removed invalid environment variable (before import attempt)",
+                                    var_name=var_name,
+                                    original_value=value,
+                                    attempt=attempt + 1
+                                )
+                
+                # Try importing
+                module = __import__(module_path, fromlist=[function_name])
+                
+                # If we get here, import succeeded
+                # Clean env vars one more time in case load_dotenv() set them
+                for var_name in env_vars_to_sanitize:
+                    if var_name in os.environ:
+                        value = os.environ[var_name]
+                        value_stripped = str(value).strip()
+                        value_lower = value_stripped.lower()
+                        if value_lower in ("none", "null") or value_stripped == "":
+                            del os.environ[var_name]
+                            logger.info(
+                                "Removed invalid environment variable (post-import)",
+                                var_name=var_name,
+                                original_value=value
+                            )
+                
+                # Success - break out of retry loop
+                break
+                
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                
+                # Check if this is the error we're trying to fix
+                if "invalid literal for int()" in error_str and "None" in error_str:
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            "Import failed due to invalid env var, will retry",
+                            error=error_str,
+                            attempt=attempt + 1,
+                            max_retries=max_retries,
+                            exc_info=True
+                        )
+                        
+                        # Remove module from cache
+                        import sys
+                        modules_to_remove = [module_path]
+                        for key in list(sys.modules.keys()):
+                            if key == module_path or key.startswith(module_path + "."):
+                                modules_to_remove.append(key)
+                        
+                        for mod_name in modules_to_remove:
+                            if mod_name in sys.modules:
+                                del sys.modules[mod_name]
+                                logger.debug("Removed module from cache", module=mod_name)
+                        
+                        # Clean env vars before retry
+                        for var_name in env_vars_to_sanitize:
+                            if var_name in os.environ:
+                                value = os.environ[var_name]
+                                value_stripped = str(value).strip()
+                                value_lower = value_stripped.lower()
+                                if value_lower in ("none", "null") or value_stripped == "":
+                                    del os.environ[var_name]
+                                    logger.info(
+                                        "Removed invalid environment variable (before retry)",
+                                        var_name=var_name,
+                                        original_value=value,
+                                        attempt=attempt + 2
+                                    )
+                    else:
+                        # Last attempt failed
+                        logger.error(
+                            "Import failed after all retries",
+                            error=error_str,
+                            max_retries=max_retries,
+                            exc_info=True
+                        )
+                        raise
+                else:
+                    # Different error - don't retry
+                    raise
+        
+        # If we get here, import succeeded (module is defined)
         if hasattr(module, function_name):
             mount_function = getattr(module, function_name)
-            # Prefer mount(app, base_path=...) if available
+            mounted = None
+
+            # Allow three patterns for backwards/forwards compatibility:
+            # 1) mount(app) style (legacy)
+            # 2) mount(app=app) style
+            # 3) main() style returning FastAPI / APIRouter (http_main:main)
             try:
-                mount_function(app)
+                mounted = mount_function(app)
             except TypeError:
-                # Attempt to call with keyword if function signature supports it
                 try:
-                    mount_function(app=app)
-                except Exception:
-                    raise
-            logger.info("Mounted agent REST routes", entry=rest_path)
+                    mounted = mount_function(app=app)
+                except TypeError:
+                    # Zero-arg factory: treat as app factory and call with no args
+                    mounted = mount_function()
+
+            # If the function returned a FastAPI app or APIRouter, include its routes
+            from fastapi import FastAPI as _FastAPI, APIRouter as _APIRouter
+            target = app  # FastAPI 또는 APIRouter 모두 include_router 사용 가능
+            if isinstance(mounted, _FastAPI):
+                target.include_router(mounted.router)
+                logger.info(
+                    "Mounted agent REST FastAPI app from entry",
+                    entry=rest_path,
+                    routes=len(getattr(mounted.router, "routes", [])),
+                )
+            elif isinstance(mounted, _APIRouter):
+                target.include_router(mounted)
+                logger.info(
+                    "Mounted agent REST router from entry",
+                    entry=rest_path,
+                    routes=len(getattr(mounted, "routes", [])),
+                )
+            else:
+                logger.info("Mounted agent REST routes", entry=rest_path)
         else:
             logger.warning("Mount function not found", function=function_name)
             

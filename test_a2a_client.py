@@ -1,102 +1,84 @@
 #!/usr/bin/env python3
 """
-A2A gRPC client for testing deployed agent communication.
-This script demonstrates how to communicate with a deployed agent via A2A.
+HTTP 기반 A2A/REST 헬스 체크 클라이언트.
+
+기존 gRPC A2A 클라이언트를 버리고, 현재 구조(HTTP A2A + REST)를 기준으로
+간단한 헬스 체크를 수행하는 스크립트입니다.
+
+기본 사용:
+    python test_a2a_client.py               # http://127.0.0.1:50051 기준
+    python test_a2a_client.py 127.0.0.1:9999
+    python test_a2a_client.py http://127.0.0.1:9999
 """
 
 import asyncio
 import sys
-import time
-from pathlib import Path
+from urllib.parse import urlparse
 
-# Add the runtime src to path so we can import the protobuf definitions
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
-import grpc
-from pixell_runtime.proto import agent_pb2, agent_pb2_grpc
+import httpx
 
 
-async def test_a2a_communication(host: str = "127.0.0.1", port: int = 50051):
-    """Test A2A communication with a deployed agent."""
+async def test_http_a2a(base_url: str) -> None:
+    """HTTP A2A / REST 헬스 체크를 수행한다."""
+    # base_url 정규화
+    if not base_url.startswith("http://") and not base_url.startswith("https://"):
+        base_url = f"http://{base_url}"
 
-    # Create gRPC channel
-    channel = grpc.aio.insecure_channel(f"{host}:{port}")
-    stub = agent_pb2_grpc.AgentServiceStub(channel)
+    parsed = urlparse(base_url)
+    host_port = f"{parsed.hostname}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"
 
-    try:
-        print(f"🔗 Connecting to agent at {host}:{port}")
-
-        # 1. Health check
-        print("\n1️⃣ Testing Health Check...")
-        try:
-            health_response = await stub.Health(agent_pb2.Empty())
-            print(f"✅ Health: ok={health_response.ok}, message='{health_response.message}'")
-        except Exception as e:
-            print(f"❌ Health check failed: {e}")
-            return
-
-        # 2. Ping test
-        print("\n2️⃣ Testing Ping...")
-        try:
-            ping_response = await stub.Ping(agent_pb2.Empty())
-            print(f"✅ Ping: message='{ping_response.message}', timestamp={ping_response.timestamp}")
-        except Exception as e:
-            print(f"❌ Ping failed: {e}")
-
-        # 3. Describe capabilities
-        print("\n3️⃣ Testing Capabilities...")
-        try:
-            capabilities = await stub.DescribeCapabilities(agent_pb2.Empty())
-            print(f"✅ Capabilities:")
-            print(f"   Methods: {list(capabilities.methods)}")
-            print(f"   Metadata: {dict(capabilities.metadata)}")
-        except Exception as e:
-            print(f"❌ Capabilities check failed: {e}")
-
-        # 4. Test action invocation
-        print("\n4️⃣ Testing Action Invocation...")
-        try:
-            request = agent_pb2.ActionRequest(
-                action="comment",
-                parameters={
-                    "text": "Hello from A2A gRPC client! Can you help me understand this code?"
-                },
-                request_id=f"test-{int(time.time())}"
-            )
-
-            result = await stub.Invoke(request)
-            print(f"✅ Action Result:")
-            print(f"   Success: {result.success}")
-            print(f"   Result: {result.result}")
-            print(f"   Duration: {result.duration_ms}ms")
-            if result.error:
-                print(f"   Error: {result.error}")
-        except Exception as e:
-            print(f"❌ Action invocation failed: {e}")
-
-    finally:
-        await channel.close()
-
-
-def main():
-    """Main entry point."""
-    if len(sys.argv) > 1:
-        host_port = sys.argv[1]
-        if ":" in host_port:
-            host, port = host_port.split(":", 1)
-            port = int(port)
-        else:
-            host = host_port
-            port = 50051
-    else:
-        host = "127.0.0.1"
-        port = 50051
-
-    print(f"🤖 Testing A2A communication with deployed agent")
-    print(f"📍 Target: {host}:{port}")
+    print(f"🤖 HTTP 기반 A2A/REST 헬스 체크")
+    print(f"📍 Target: {base_url} ({host_port})")
     print("=" * 60)
 
-    asyncio.run(test_a2a_communication(host, port))
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        # 1. /health (REST 런타임 또는 앱 헬스)
+        print("\n1️⃣ GET /health")
+        try:
+            resp = await client.get(f"{base_url}/health")
+            print(f"✅ 상태코드: {resp.status_code}")
+            try:
+                print(f"✅ 응답 JSON: {resp.json()}")
+            except Exception:
+                print(f"ℹ️ 응답 텍스트: {resp.text[:500]}")
+        except Exception as e:
+            print(f"❌ /health 요청 실패: {e}")
+
+        # 2. / (루트 페이지 - UI 혹은 기본 응답)
+        print("\n2️⃣ GET /")
+        try:
+            resp = await client.get(f"{base_url}/")
+            print(f"✅ 상태코드: {resp.status_code}")
+            text = resp.text
+            print(f"ℹ️ 본문 미리보기:\n{text[:500]}")
+        except Exception as e:
+            print(f"❌ / 요청 실패: {e}")
+
+        # 3. 선택: /meta (Pixell Runtime REST가 노출하는 메타 정보, 없으면 그냥 스킵)
+        print("\n3️⃣ GET /meta (있으면 Pixell Runtime 메타 정보)")
+        try:
+            resp = await client.get(f"{base_url}/meta")
+            if resp.status_code == 200:
+                print(f"✅ 상태코드: {resp.status_code}")
+                try:
+                    print(f"✅ 응답 JSON: {resp.json()}")
+                except Exception:
+                    print(f"ℹ️ 응답 텍스트: {resp.text[:500]}")
+            else:
+                print(f"ℹ️ /meta 상태코드: {resp.status_code} (엔드포인트 없을 수 있음)")
+        except Exception as e:
+            print(f"ℹ️ /meta 요청 실패 (엔드포인트 없을 수 있음): {e}")
+
+
+def main() -> None:
+    """엔트리 포인트."""
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+    else:
+        # 기본값: HTTP A2A를 50051 포트로 띄웠다고 가정
+        target = "127.0.0.1:50051"
+
+    asyncio.run(test_http_a2a(target))
 
 
 if __name__ == "__main__":

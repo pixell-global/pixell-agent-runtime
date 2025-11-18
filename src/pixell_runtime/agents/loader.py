@@ -214,6 +214,36 @@ class PackageLoader:
         description = manifest_data.get("description", "")
         author = manifest_data.get("author", "")
         
+        # Parse three-surface configuration (A2A first so we can derive sensible defaults)
+        a2a_config = None
+        a2a_data = manifest_data.get("a2a") or {}
+        if a2a_data:
+            # Backwards/forwards compatibility:
+            # - Older specs used `service` (gRPC)
+            # - Newer HTTP-based specs may use `http_server`
+            # - Some agents (like vivid-commenter) use generic `entry`
+            #   which should be treated as the HTTP server entrypoint.
+            # 새로운 패키징 구조: agent.yaml에 설정된 경로 그대로 사용 (dist 폴더 구조 없음)
+            http_server = a2a_data.get("http_server") or a2a_data.get("entry")
+            service = a2a_data.get("service")
+
+            a2a_config = A2AConfig(
+                service=service,
+                http_server=http_server,
+            )
+
+        # Derive a default entrypoint/handler path.
+        # Newer packages may rely purely on surfaces (a2a/rest/ui) and omit `entrypoint`.
+        # To keep AgentExport/AgentManifest consistent, we:
+        #   1) Prefer explicit `entrypoint`
+        #   2) Fall back to any A2A entry/service if present
+        #   3) Fall back to a conventional default for legacy packages
+        explicit_entrypoint = manifest_data.get("entrypoint")
+        a2a_fallback = None
+        if a2a_data and a2a_config:
+            a2a_fallback = a2a_config.service or a2a_config.http_server
+        entrypoint = explicit_entrypoint or a2a_fallback or "src.main:handler"
+
         # For this Python agent, we'll create exports based on the sub_agents
         exports = []
         
@@ -229,15 +259,12 @@ class PackageLoader:
                     name=sub_agent["description"],
                     description=sub_agent["description"],
                     version=version,
-                    handler=f"{manifest_data['entrypoint']}:{sub_agent['name']}",
+                    handler=f"{entrypoint}:{sub_agent['name']}",
                     private=not sub_agent.get("public", True)
                 )
                 exports.append(export)
         else:
-            # Create a default export from entrypoint (required)
-            entrypoint = manifest_data.get("entrypoint")
-            if not entrypoint:
-                raise PackageValidationError("Manifest missing required 'entrypoint'")
+            # Create a default export from resolved entrypoint (now optional in manifest)
             export = AgentExport(
                 id="default",
                 name=name,
@@ -248,18 +275,15 @@ class PackageLoader:
             )
             exports.append(export)
         
-        # Parse three-surface configuration
-        a2a_config = None
-        if "a2a" in manifest_data:
-            a2a_data = manifest_data["a2a"]
-            a2a_config = A2AConfig(service=a2a_data.get("service"))
-        
         rest_config = None
         if "rest" in manifest_data:
-            rest_data = manifest_data["rest"]
-            if "entry" not in rest_data or not rest_data.get("entry"):
+            rest_data = manifest_data["rest"] or {}
+            entry = rest_data.get("entry")
+            if not entry:
                 raise PackageValidationError("REST config missing required 'entry'")
-            rest_config = RESTConfig(entry=rest_data.get("entry"))
+
+            # 새로운 패키징 구조: agent.yaml에 설정된 경로 그대로 사용 (dist 폴더 구조 없음)
+            rest_config = RESTConfig(entry=entry)
         
         ui_config = None
         if "ui" in manifest_data:
@@ -279,7 +303,7 @@ class PackageLoader:
         return AgentManifest(
             name=name,
             version=version,
-            entrypoint=manifest_data.get("entrypoint"),
+            entrypoint=entrypoint,
             runtime_version="0.1.0",  # Default for now
             description=description,
             author=author,
@@ -313,24 +337,30 @@ class PackageLoader:
                     shutil.copyfileobj(src, dst)
 
     def _calculate_requirements_hash(self, package_path: Path) -> str:
-        """Calculate SHA256 hash of requirements.txt.
+        """Calculate SHA256 hash of dependency file (pyproject.toml or requirements.txt).
 
         Args:
             package_path: Path to extracted package
 
         Returns:
-            Short SHA256 hash (7 chars) or 'no-deps' if no requirements.txt
+            Short SHA256 hash (7 chars) or 'no-deps' if no dependency file
         """
+        # 우선순위: pyproject.toml > requirements.txt
+        pyproject_file = package_path / "pyproject.toml"
         requirements_file = package_path / "requirements.txt"
 
-        if not requirements_file.exists():
+        if pyproject_file.exists():
+            sha256_hash = hashlib.sha256()
+            with open(pyproject_file, "rb") as f:
+                sha256_hash.update(f.read())
+            return sha256_hash.hexdigest()[:7]
+        elif requirements_file.exists():
+            sha256_hash = hashlib.sha256()
+            with open(requirements_file, "rb") as f:
+                sha256_hash.update(f.read())
+            return sha256_hash.hexdigest()[:7]
+        else:
             return "no-deps"
-
-        sha256_hash = hashlib.sha256()
-        with open(requirements_file, "rb") as f:
-            sha256_hash.update(f.read())
-
-        return sha256_hash.hexdigest()[:7]
 
     def _get_codeartifact_pip_index(self) -> Optional[str]:
         """Get CodeArtifact pip index URL with auth token.
@@ -384,7 +414,7 @@ class PackageLoader:
         package_path: Path,
         venv_name: str
     ) -> bool:
-        """Install dependencies from requirements.txt into agent venv.
+        """Install dependencies from pyproject.toml (preferred) or requirements.txt into agent venv.
 
         Args:
             venv_path: Path to the virtual environment
@@ -392,41 +422,50 @@ class PackageLoader:
             venv_name: Name of venv for logging
 
         Returns:
-            True if requirements installed successfully or no requirements file,
+            True if requirements installed successfully or no dependency file,
             False if installation failed
 
         Raises:
             PackageLoadError: If requirements installation fails critically
         """
+        pyproject_file = package_path / "pyproject.toml"
         req_file = package_path / "requirements.txt"
 
-        # If no requirements.txt, nothing to do
-        if not req_file.exists():
-            logger.info("No requirements.txt found, skipping dependency installation",
+        # 우선순위: pyproject.toml > requirements.txt
+        use_pyproject = pyproject_file.exists()
+        
+        if not use_pyproject and not req_file.exists():
+            logger.info("No pyproject.toml or requirements.txt found, skipping dependency installation",
                        venv=venv_name,
                        package_path=str(package_path))
             return True
 
-        # Check if requirements.txt is empty
-        try:
-            with open(req_file, 'r') as f:
-                content = f.read().strip()
-                # Filter out comments and empty lines
-                lines = [line.strip() for line in content.split('\n')
-                        if line.strip() and not line.strip().startswith('#')]
+        # Check if dependency file is valid
+        if use_pyproject:
+            logger.info("Found pyproject.toml, using it for dependency installation",
+                       venv=venv_name,
+                       package_path=str(package_path))
+        else:
+            # Check if requirements.txt is empty
+            try:
+                with open(req_file, 'r') as f:
+                    content = f.read().strip()
+                    # Filter out comments and empty lines
+                    lines = [line.strip() for line in content.split('\n')
+                            if line.strip() and not line.strip().startswith('#')]
 
-                if not lines:
-                    logger.info("requirements.txt is empty, skipping dependency installation",
-                               venv=venv_name)
-                    return True
+                    if not lines:
+                        logger.info("requirements.txt is empty, skipping dependency installation",
+                                   venv=venv_name)
+                        return True
 
-                logger.info("Found requirements.txt with dependencies",
-                           venv=venv_name,
-                           line_count=len(lines))
-        except Exception as e:
-            logger.warning("Failed to read requirements.txt, attempting install anyway",
-                          venv=venv_name,
-                          error=str(e))
+                    logger.info("Found requirements.txt with dependencies",
+                               venv=venv_name,
+                               line_count=len(lines))
+            except Exception as e:
+                logger.warning("Failed to read requirements.txt, attempting install anyway",
+                              venv=venv_name,
+                              error=str(e))
 
         # Determine pip path
         if sys.platform == "win32":
@@ -471,7 +510,13 @@ class PackageLoader:
                 python_path = venv_path / "Scripts" / "python.exe"
             else:
                 python_path = venv_path / "bin" / "python"
-            install_cmd = ["uv", "pip", "install", "-r", str(req_file), "--python", str(python_path)]
+            
+            if use_pyproject:
+                # pyproject.toml 사용: editable install
+                install_cmd = ["uv", "pip", "install", "-e", str(package_path), "--python", str(python_path)]
+            else:
+                # requirements.txt 사용
+                install_cmd = ["uv", "pip", "install", "-r", str(req_file), "--python", str(python_path)]
 
             if pip_index_url:
                 install_cmd.extend(["--index-url", pip_index_url])
@@ -479,9 +524,10 @@ class PackageLoader:
             # Add wheelhouse args (uv supports --find-links)
             install_cmd.extend(wheelhouse_args)
 
+            dep_file = "pyproject.toml" if use_pyproject else str(req_file)
             logger.info("Installing dependencies with uv (fast mode)",
                        venv=venv_name,
-                       requirements_file=str(req_file),
+                       dependency_file=dep_file,
                        command=" ".join(install_cmd))
 
             try:
@@ -509,18 +555,24 @@ class PackageLoader:
 
         # Fallback to pip if uv not available or failed
         if result is None or result.returncode != 0:
-            install_cmd = [str(pip_path), "install", "-r", str(req_file)]
+            if use_pyproject:
+                # pyproject.toml 사용: editable install
+                install_cmd = [str(pip_path), "install", "-e", str(package_path)]
+            else:
+                # requirements.txt 사용
+                install_cmd = [str(pip_path), "install", "-r", str(req_file)]
 
             if pip_index_url:
                 install_cmd.extend(["--index-url", pip_index_url])
-                logger.debug("Using CodeArtifact index for requirements installation",
+                logger.debug("Using CodeArtifact index for dependency installation",
                             venv=venv_name)
 
             install_cmd.extend(wheelhouse_args)
 
-            logger.info("Installing dependencies from requirements.txt with pip",
+            dep_file = "pyproject.toml" if use_pyproject else str(req_file)
+            logger.info("Installing dependencies with pip",
                        venv=venv_name,
-                       requirements_file=str(req_file),
+                       dependency_file=dep_file,
                        command=" ".join(install_cmd))
 
             try:
@@ -532,8 +584,10 @@ class PackageLoader:
                 )
 
                 if result.returncode != 0:
-                    logger.error("Requirements installation failed",
+                    dep_file = "pyproject.toml" if use_pyproject else "requirements.txt"
+                    logger.error("Dependency installation failed",
                                 venv=venv_name,
+                                dependency_file=dep_file,
                                 returncode=result.returncode,
                                 stderr=result.stderr,
                                 stdout=result.stdout)
@@ -542,7 +596,7 @@ class PackageLoader:
                     if "Could not find a version" in result.stderr:
                         raise PackageLoadError(
                             f"Dependency not found in PyPI/CodeArtifact. "
-                            f"Check requirements.txt for typos or unavailable packages: {result.stderr}"
+                            f"Check {dep_file} for typos or unavailable packages: {result.stderr}"
                         )
                     elif "THESE PACKAGES DO NOT MATCH THE HASHES" in result.stderr:
                         raise PackageLoadError(
@@ -550,15 +604,16 @@ class PackageLoader:
                         )
                     elif "ERROR: No matching distribution" in result.stderr:
                         raise PackageLoadError(
-                            f"Package version not found. Check version constraints: {result.stderr}"
+                            f"Package version not found. Check version constraints in {dep_file}: {result.stderr}"
                         )
                     else:
-                        raise PackageLoadError(f"Requirements installation failed: {result.stderr}")
+                        raise PackageLoadError(f"Dependency installation from {dep_file} failed: {result.stderr}")
 
                 # Log successful installation
-                logger.info("Requirements installed successfully",
+                dep_file = "pyproject.toml" if use_pyproject else str(req_file)
+                logger.info("Dependencies installed successfully",
                            venv=venv_name,
-                           requirements_file=str(req_file))
+                           dependency_file=dep_file)
 
                 # Parse and log installed packages (optional, for debugging)
                 if result.stdout:
@@ -784,8 +839,11 @@ class PackageLoader:
         Returns:
             True if venv is valid, False otherwise
         """
-        # Check Python executable exists
-        python_path = venv_path / "bin" / "python"
+        # Check Python executable exists (Windows uses Scripts/python.exe, Unix uses bin/python)
+        if sys.platform == "win32":
+            python_path = venv_path / "Scripts" / "python.exe"
+        else:
+            python_path = venv_path / "bin" / "python"
         if not python_path.exists():
             logger.warning("Venv missing python executable", venv=venv_path.name)
             return False
