@@ -59,7 +59,7 @@ def _load_env_from_apkg(apkg_path: Path) -> None:
 
 async def main():
     """Run the example agent."""
-    apkg_path = Path("vivid-commenter-v2-1.0.9.apkg")
+    apkg_path = Path("paf-core-agent-1.0.0.apkg")
     
     if not apkg_path.exists():
         print(f"Example agent package not found: {apkg_path}")
