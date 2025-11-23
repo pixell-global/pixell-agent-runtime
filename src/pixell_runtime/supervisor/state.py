@@ -187,17 +187,30 @@ class SupervisorState:
                 exc_info=True,
             )
 
-            # Update status
-            if agent_app_id in self.agents:
-                self.agents[agent_app_id].status = AgentStatus.FAILED
-                self.agents[agent_app_id].error_message = str(e)
-
             # Try to clean up resources
             try:
                 if self.process_manager.is_running(agent_app_id):
                     self.process_manager.stop_agent(agent_app_id, force=True)
             except Exception:
                 pass
+
+            # Release ports if allocated
+            try:
+                if agent_app_id in self.agents:
+                    # Ports were allocated, release them
+                    self.port_allocator.release(agent_app_id)
+            except Exception:
+                pass
+
+            # Remove from agents dict to allow retry
+            # This ensures failed deployments don't block future deployment attempts
+            if agent_app_id in self.agents:
+                logger.info(
+                    "Removing failed agent from state to allow retry",
+                    agent_app_id=agent_app_id,
+                    status=self.agents[agent_app_id].status.value if self.agents[agent_app_id].status else "unknown",
+                )
+                del self.agents[agent_app_id]
 
             raise
 
