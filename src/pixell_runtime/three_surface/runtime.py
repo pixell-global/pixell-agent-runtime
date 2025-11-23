@@ -94,7 +94,9 @@ class ThreeSurfaceRuntime:
         self._respect_env_base_path = "BASE_PATH" in _os.environ
 
         # Setup logging and bind correlation context
-        setup_logging("INFO", "json")
+        log_level = os.getenv("LOG_LEVEL", "INFO").lower()
+        log_format = os.getenv("LOG_FORMAT", "json").lower()
+        setup_logging(log_level=log_level, log_format=log_format)
         from pixell_runtime.utils.logging import bind_runtime_context
         bind_runtime_context(
             agent_app_id=self.agent_app_id,

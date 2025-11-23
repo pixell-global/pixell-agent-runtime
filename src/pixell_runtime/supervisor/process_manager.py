@@ -1,6 +1,7 @@
 """Process management for agent lifecycle."""
 
 import asyncio
+import os
 import subprocess
 import signal
 import time
@@ -79,6 +80,17 @@ class ProcessManager:
             "MULTIPLEXED": "true",
             "PYTHONUNBUFFERED": "1",  # Ensure logs are not buffered
         }
+        
+        # Forward logging-related environment variables from supervisor to agent
+        log_dir = os.getenv("LOG_DIR")
+        if log_dir:
+            process_env["LOG_DIR"] = log_dir
+        log_level = os.getenv("LOG_LEVEL")
+        if log_level:
+            process_env["LOG_LEVEL"] = log_level
+        log_format = os.getenv("LOG_FORMAT")
+        if log_format:
+            process_env["LOG_FORMAT"] = log_format
 
         # Add custom environment variables
         if env:

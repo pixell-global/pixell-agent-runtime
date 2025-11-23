@@ -7,6 +7,12 @@ Used by: python -m pixell_runtime.supervisor
 import os
 import sys
 import structlog
+from pixell_runtime.utils.logging import setup_logging
+
+# Setup logging before creating logger
+log_level = os.getenv("LOG_LEVEL", "INFO").lower()
+log_format = os.getenv("LOG_FORMAT", "json").lower()
+setup_logging(log_level=log_level, log_format=log_format)
 
 logger = structlog.get_logger()
 
@@ -30,6 +36,9 @@ def main():
         package_cache_dir=os.getenv("PACKAGE_CACHE_DIR", "/var/lib/pixell/packages"),
         package_extract_dir=os.getenv("PACKAGE_EXTRACT_DIR", "/var/lib/pixell/extracted"),
         max_agents=os.getenv("MAX_AGENTS", "20"),
+        log_dir=os.getenv("LOG_DIR", "not set"),
+        log_level=log_level,
+        log_format=log_format,
     )
 
     # Import and run uvicorn
