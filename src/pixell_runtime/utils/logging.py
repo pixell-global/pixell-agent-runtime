@@ -51,6 +51,17 @@ def setup_logging(log_level: str = "INFO", log_format: str = "json", log_file_pa
             log_dir_path = Path(log_dir)
             try:
                 log_dir_path.mkdir(parents=True, exist_ok=True)
+                # Set permissions to allow all users to write (for agent processes running as different users)
+                # Use 0o1777 (sticky bit + rwx for all) so all users can create files but only delete their own
+                try:
+                    log_dir_path.chmod(0o1777)
+                except Exception as perm_error:
+                    # If we can't set permissions (e.g., not running as root), try 0o777
+                    try:
+                        log_dir_path.chmod(0o777)
+                    except Exception:
+                        # If permission setting fails, log warning but continue
+                        print(f"[LOGGING WARNING] Could not set permissions on log directory {log_dir_path}: {perm_error}", file=sys.stderr, flush=True)
             except Exception as e:
                 print(f"[LOGGING ERROR] Failed to create log directory {log_dir_path}: {e}", file=sys.stderr, flush=True)
                 log_dir = None  # Disable file logging if directory creation fails
