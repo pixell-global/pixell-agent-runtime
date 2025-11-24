@@ -1,6 +1,10 @@
 """Supervisor state management for agent deployments."""
 
 import asyncio
+import os
+import shutil
+import subprocess
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict
@@ -18,6 +22,7 @@ from pixell_runtime.supervisor.user_manager import LinuxUserManager
 from pixell_runtime.supervisor.port_allocator import PortAllocator
 from pixell_runtime.supervisor.package_downloader import PackageDownloader
 from pixell_runtime.supervisor.process_manager import ProcessManager
+from pixell_runtime.agents.loader import PackageLoader
 
 logger = structlog.get_logger()
 
@@ -52,10 +57,15 @@ class SupervisorState:
         self.package_downloader = package_downloader or PackageDownloader()
         self.process_manager = process_manager or ProcessManager()
 
+        # Setup package extract directory
+        extract_dir = Path(os.getenv("PACKAGE_EXTRACT_DIR", "/var/lib/pixell/extracted"))
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        self.extract_dir = extract_dir
+
         # Track agent processes: agent_app_id -> AgentProcess
         self.agents: Dict[str, AgentProcess] = {}
 
-        logger.info("SupervisorState initialized")
+        logger.info("SupervisorState initialized", extract_dir=str(extract_dir))
 
     async def deploy(self, request: DeployRequest) -> AgentProcess:
         """Deploy a new agent.
@@ -131,19 +141,77 @@ class SupervisorState:
             self.agents[agent_app_id] = agent_process
 
             # Step 3: Download package
-            package_path = self.package_downloader.download(
+            apkg_path = self.package_downloader.download(
                 request.package_url,
                 request.package_sha256,
             )
-            agent_process.package_path = str(package_path)
+            logger.info("Downloaded package", agent_app_id=agent_app_id, path=str(apkg_path))
 
-            logger.info("Downloaded package", agent_app_id=agent_app_id, path=str(package_path))
+            # Step 4: Extract and load package with PackageLoader
+            # Extract to user-specific directory
+            extract_path = self.extract_dir / agent_app_id
+            if extract_path.exists():
+                logger.info("Package already extracted, removing old extraction", agent_app_id=agent_app_id)
+                import shutil
+                shutil.rmtree(extract_path)
+            
+            # Extract APKG
+            extract_path.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(apkg_path, 'r') as zf:
+                zf.extractall(extract_path)
+            logger.info("Extracted package", agent_app_id=agent_app_id, path=str(extract_path))
 
-            # Step 4: Spawn agent process
+            # Change ownership of extracted package to agent user
+            subprocess.run(
+                ["chown", "-R", f"{username}:{username}", str(extract_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            # Load package and create virtual environment
+            # Use user's home directory for venvs
+            venvs_dir = home_dir / "venvs"
+            venvs_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["chown", "-R", f"{username}:{username}", str(venvs_dir)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            loader = PackageLoader(
+                packages_dir=self.extract_dir,
+                venvs_dir=venvs_dir,
+            )
+            
+            package = loader.load_package(extract_path, agent_app_id=agent_app_id)
+            logger.info(
+                "Package loaded with virtual environment",
+                agent_app_id=agent_app_id,
+                package_id=package.id,
+                venv_path=package.venv_path,
+            )
+
+            # Change ownership of venv to agent user
+            if package.venv_path:
+                venv_path = Path(package.venv_path)
+                subprocess.run(
+                    ["chown", "-R", f"{username}:{username}", str(venv_path)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
+            agent_process.package_path = str(extract_path)
+            agent_process.venv_path = package.venv_path
+
+            # Step 5: Spawn agent process
             pid = self.process_manager.spawn_agent(
                 agent_app_id=agent_app_id,
                 linux_user=username,
-                package_path=package_path,
+                package_path=extract_path,
+                venv_path=package.venv_path,
                 ports=ports,
                 env=request.env,
             )
@@ -152,7 +220,7 @@ class SupervisorState:
 
             logger.info("Spawned agent process", agent_app_id=agent_app_id, pid=pid)
 
-            # Step 5: Wait for health check (with timeout)
+            # Step 6: Wait for health check (with timeout)
             health_timeout = request.boot_budget_ms * request.boot_hard_limit_multiplier / 1000
             health_start = datetime.now()
 
@@ -252,7 +320,7 @@ class SupervisorState:
             agent_process.status = AgentStatus.UPDATING
 
             # Download new package
-            package_path = self.package_downloader.download(
+            apkg_path = self.package_downloader.download(
                 request.package_url,
                 request.package_sha256,
                 force_refresh=True,  # Force download even if cached
@@ -265,11 +333,111 @@ class SupervisorState:
                 self.process_manager.stop_agent(agent_app_id)
                 logger.info("Stopped old agent process", agent_app_id=agent_app_id)
 
+            # Extract and load new package
+            username = agent_process.linux_user
+            home_dir = self.user_manager.get_home_dir(agent_app_id)
+            extract_path = self.extract_dir / agent_app_id
+            
+            # Remove old extraction if exists
+            if extract_path.exists():
+                import shutil
+                shutil.rmtree(extract_path)
+            
+            # Extract APKG
+            extract_path.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(apkg_path, 'r') as zf:
+                zf.extractall(extract_path)
+            logger.info("Extracted new package", agent_app_id=agent_app_id, path=str(extract_path))
+
+            # Change ownership to agent user
+            subprocess.run(
+                ["chown", "-R", f"{username}:{username}", str(extract_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            # Load package and create/update virtual environment
+            venvs_dir = home_dir / "venvs"
+            venvs_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["chown", "-R", f"{username}:{username}", str(venvs_dir)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            # Clean up old virtual environments for this agent_app_id
+            # This ensures requirements changes trigger fresh venv creation
+            old_venv_path = agent_process.venv_path
+            if old_venv_path:
+                old_venv = Path(old_venv_path)
+                if old_venv.exists() and old_venv.parent == venvs_dir:
+                    logger.info(
+                        "Removing old virtual environment",
+                        agent_app_id=agent_app_id,
+                        old_venv=str(old_venv),
+                    )
+                    try:
+                        shutil.rmtree(old_venv)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to remove old venv, continuing",
+                            agent_app_id=agent_app_id,
+                            old_venv=str(old_venv),
+                            error=str(e),
+                        )
+            
+            # Also clean up any other venvs for this agent_app_id (in case of multiple)
+            # Find all venvs starting with agent_app_id
+            if venvs_dir.exists():
+                for venv_item in venvs_dir.iterdir():
+                    if venv_item.is_dir() and venv_item.name.startswith(f"{agent_app_id}_"):
+                        if venv_item != old_venv:  # Don't delete twice
+                            logger.info(
+                                "Removing old virtual environment",
+                                agent_app_id=agent_app_id,
+                                old_venv=str(venv_item),
+                            )
+                            try:
+                                shutil.rmtree(venv_item)
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to remove old venv, continuing",
+                                    agent_app_id=agent_app_id,
+                                    old_venv=str(venv_item),
+                                    error=str(e),
+                                )
+
+            loader = PackageLoader(
+                packages_dir=self.extract_dir,
+                venvs_dir=venvs_dir,
+            )
+            
+            package = loader.load_package(extract_path, agent_app_id=agent_app_id)
+            logger.info(
+                "Package loaded with virtual environment",
+                agent_app_id=agent_app_id,
+                package_id=package.id,
+                venv_path=package.venv_path,
+            )
+
+            # Change ownership of venv to agent user
+            if package.venv_path:
+                venv_path = Path(package.venv_path)
+                subprocess.run(
+                    ["chown", "-R", f"{username}:{username}", str(venv_path)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
             # Update agent info
             agent_process.deployment_id = request.deployment_id
             agent_process.package_url = request.package_url
-            agent_process.package_path = str(package_path)
+            agent_process.package_path = str(extract_path)
             agent_process.package_sha256 = request.package_sha256
+            agent_process.venv_path = package.venv_path
 
             # Apply config updates if provided
             if request.max_package_size_mb is not None:
@@ -285,7 +453,8 @@ class SupervisorState:
             pid = self.process_manager.spawn_agent(
                 agent_app_id=agent_app_id,
                 linux_user=agent_process.linux_user,
-                package_path=Path(package_path),
+                package_path=extract_path,
+                venv_path=package.venv_path,
                 ports=agent_process.ports,
                 env=request.env or {},
             )

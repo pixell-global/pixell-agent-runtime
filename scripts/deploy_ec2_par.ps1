@@ -42,25 +42,41 @@ Write-Info "[OK] Prerequisites OK"
 
 # Step 2: build wheel
 Write-Step "2/7" "Building PAR wheel package..."
-$env:PIP_BREAK_SYSTEM_PACKAGES = "1"   # 억지로라도 pip install 가능하게
-# PowerShell 5에서는 try/catch를 한 줄로 작성하면 파싱 오류가 발생하므로 명시적으로 개행을 사용
-try
-{
-    python -m pip install --quiet build | Out-Null
+
+# Check if pip is available
+python -m pip --version 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warn "pip not available, attempting to install..."
+    # Try to ensure pip is available
+    python -m ensurepip --upgrade 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Fail "pip is not available and cannot be installed. Please install pip first."
+    }
 }
-catch
-{
-    Write-Warn ("python -m pip install build failed: {0}" -f $_)
-    Fail "Install python build module first"
+
+# Install build package (try user install if system install fails)
+Write-Info "Installing build package..."
+$buildInstall = python -m pip install --quiet --upgrade build 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Warn "System install failed, trying user install..."
+    python -m pip install --user --upgrade build 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Failed to install build package. Error: $buildInstall"
+    }
 }
+
+# Clean previous builds
 if (Test-Path dist) { Remove-Item dist -Recurse -Force }
 if (Test-Path build) { Remove-Item build -Recurse -Force }
-Get-ChildItem *.egg-info | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+Get-ChildItem *.egg-info -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
+# Build wheel
 Write-Info "Running: python -m build --wheel"
-$buildResult = python -m build --wheel
-if ($LASTEXITCODE -ne 0) {
-    Fail "Failed to build wheel package"
+$buildOutput = python -m build --wheel 2>&1
+$buildExitCode = $LASTEXITCODE
+if ($buildExitCode -ne 0) {
+    Write-Err "Build output: $buildOutput"
+    Fail "Failed to build wheel package (exit code: $buildExitCode)"
 }
 
 $wheel = Get-ChildItem dist/pixell_runtime-*.whl | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -109,15 +125,26 @@ Write-Info "[OK] Wheel uploaded to $s3Url"
 Write-Step "5/7" "Installing PAR on EC2..."
 $commands = @(
     "set -e",
-    "echo '[1/6] Downloading wheel from S3...'",
+    "echo '[1/8] Downloading wheel from S3...'",
     "aws s3 cp '$s3Url' /tmp/'$($wheel.Name)' --region '$AwsRegion'",
-    "echo '[2/6] Installing Python 3.11 if needed...'",
+    "echo '[2/8] Installing Python 3.11 if needed...'",
     "sudo yum install -y python3.11 python3.11-pip python3.11-devel 2>/dev/null || echo 'Already installed'",
-    "echo '[3/6] Uninstalling old version...'",
-    "sudo pip3.11 uninstall -y pixell-runtime 2>/dev/null || echo 'No old version'",
-    "echo '[4/6] Installing new wheel...'",
-    "sudo pip3.11 install /tmp/'$($wheel.Name)'",
-    "echo '[5/6] Creating configuration and directories...'",
+    "echo '[3/8] Creating virtual environment...'",
+    "VENV_DIR=/opt/pixell-agent-runtime/venv",
+    "sudo mkdir -p /opt/pixell-agent-runtime",
+    "if [ -d `"`$VENV_DIR`" ]; then",
+    "  echo 'Removing existing virtual environment...'",
+    "  sudo rm -rf `"`$VENV_DIR`"",
+    "fi",
+    "echo 'Creating new virtual environment...'",
+    "sudo /usr/bin/python3.11 -m venv `"`$VENV_DIR`"",
+    "echo '[4/8] Upgrading pip in virtual environment...'",
+    "sudo `"`$VENV_DIR/bin/pip`" install --upgrade pip setuptools wheel",
+    "echo '[5/8] Installing pixell-runtime wheel in virtual environment...'",
+    "sudo `"`$VENV_DIR/bin/pip`" install /tmp/'$($wheel.Name)'",
+    "echo '[6/8] Verifying installation...'",
+    "`"`$VENV_DIR/bin/python`" -m pixell_runtime.supervisor --help > /dev/null 2>&1 && echo 'Installation verified' || echo 'Installation verification failed'",
+    "echo '[7/8] Creating configuration and directories...'",
     "sudo mkdir -p /etc/pixell",
     "sudo mkdir -p /var/lib/pixell/{packages,extracted,logs,agents}",
     "sudo chmod 755 /var/lib/pixell /var/lib/pixell/packages /var/lib/pixell/extracted /var/lib/pixell/logs /var/lib/pixell/agents",
@@ -147,13 +174,15 @@ Type=simple
 User=root
 WorkingDirectory=/var/lib/pixell
 EnvironmentFile=/etc/par-supervisor.conf
-ExecStart=/usr/bin/python3.11 -m pixell_runtime.supervisor
+# Use virtual environment Python
+ExecStart=/opt/pixell-agent-runtime/venv/bin/python -m pixell_runtime.supervisor
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
 ReadWritePaths=/var/lib/pixell
 ReadWritePaths=/home
+ReadWritePaths=/opt/pixell-agent-runtime
 PrivateTmp=true
 NoNewPrivileges=false
 LimitNOFILE=65536
@@ -163,13 +192,13 @@ LimitNPROC=4096
 WantedBy=multi-user.target
 EOFSVC
 "@.Trim(),
-    "echo '[6/6] Restarting supervisor service...'",
+    "echo '[8/8] Restarting supervisor service...'",
     "sudo systemctl daemon-reload",
     "sudo systemctl enable par-supervisor",
     "sudo systemctl restart par-supervisor",
     "sleep 3",
     "sudo systemctl is-active par-supervisor && echo 'Service active' || echo 'Service failed'",
-    "pip3.11 show pixell-runtime | grep Version"
+    "/opt/pixell-agent-runtime/venv/bin/pip show pixell-runtime | grep Version"
 )
 $commandJson = @{ commands = $commands } | ConvertTo-Json -Depth 3
 $tempParamFile = New-TemporaryFile
@@ -212,7 +241,7 @@ Write-Info "[OK] PAR supervisor installed on EC2"
 # Step 6: verify version
 Write-Step "6/7" "Verifying installed version..."
 $verifyTempFile = New-TemporaryFile
-[System.IO.File]::WriteAllText($verifyTempFile, (@{ commands = @("pip3.11 show pixell-runtime | grep Version") } | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+[System.IO.File]::WriteAllText($verifyTempFile, (@{ commands = @("/opt/pixell-agent-runtime/venv/bin/pip show pixell-runtime | grep Version") } | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
 $verifyId = aws ssm send-command `
     --region $AwsRegion `
     --instance-ids $InstanceId `

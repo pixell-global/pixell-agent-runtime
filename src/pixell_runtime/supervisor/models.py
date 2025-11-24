@@ -83,6 +83,7 @@ class AgentProcess(BaseModel):
     package_path: str
     package_url: str
     package_sha256: Optional[str] = None
+    venv_path: Optional[str] = Field(None, description="Virtual environment path for agent")
 
     # Timestamps
     created_at: datetime
