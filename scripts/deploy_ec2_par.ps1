@@ -1,6 +1,6 @@
 Param(
     [Parameter(Mandatory=$false)]
-    [string]$InstanceId = "i-09dcb7f387166efd0",
+    [string]$InstanceId = "i-0df57d61c09d02b00",
 
     [string]$AwsRegion = "us-east-2"
 )

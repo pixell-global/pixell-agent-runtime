@@ -492,24 +492,45 @@ class ProcessManager:
                 url = f"http://localhost:{ports.rest}/agents/{agent_app_id}/health"
                 response = await client.get(url)
 
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("status") == "healthy":
-                        logger.debug("Agent health check passed", agent_app_id=agent_app_id)
-                        return True
+                # Log response details
+                try:
+                    response_data = response.json()
+                except Exception:
+                    response_data = {"raw_text": response.text[:200]}  # Truncate if too long
 
-                logger.debug(
+                if response.status_code == 200:
+                    if response_data.get("status") == "healthy":
+                        logger.info(
+                            "Agent health check passed",
+                            agent_app_id=agent_app_id,
+                            response=response_data,
+                        )
+                        return True
+                    else:
+                        # 200 OK but status is not "healthy"
+                        logger.warning(
+                            "Agent health check returned 200 but status is not healthy",
+                            agent_app_id=agent_app_id,
+                            status_code=response.status_code,
+                            response=response_data,
+                        )
+                        return False
+
+                # Non-200 status code
+                logger.warning(
                     "Agent health check failed",
                     agent_app_id=agent_app_id,
                     status_code=response.status_code,
+                    response=response_data,
                 )
                 return False
 
         except Exception as e:
-            logger.debug(
+            logger.warning(
                 "Agent health check exception",
                 agent_app_id=agent_app_id,
                 error=str(e),
+                exc_info=True,
             )
             return False
 

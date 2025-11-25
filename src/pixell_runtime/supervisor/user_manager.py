@@ -40,7 +40,7 @@ class LinuxUserManager:
             POSIX username requirements (useradd rejects hyphens).
         """
         # Sanitize agent_app_id: replace hyphens with underscores for valid Linux usernames
-        sanitized_id = "_".join(agent_app_id.split("-")[0:2]) # TODO: 임시 버그 패치, 원본 코드 의도 파악 필요
+        sanitized_id = "_".join(agent_app_id.split("-")[0:2])
         return f"agent_{sanitized_id}"
 
     def get_home_dir(self, agent_app_id: str) -> Path:
