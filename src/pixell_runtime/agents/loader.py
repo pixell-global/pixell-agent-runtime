@@ -43,10 +43,7 @@ class PackageLoader:
         self.venvs_dir.mkdir(parents=True, exist_ok=True)
 
         # Setup pip cache directory
-        # Use HOME/.cache/pip if available (standard XDG location), otherwise fallback to /tmp
-        # This prevents permission conflicts when multiple agents share the same pip cache
-        home_dir = Path(os.environ.get("HOME", "/tmp"))
-        self.pip_cache_dir = home_dir / ".cache" / "pip"
+        self.pip_cache_dir = packages_dir.parent / "pip-cache"
         self.pip_cache_dir.mkdir(parents=True, exist_ok=True)
     
     def load_package(self, apkg_path: Path, agent_app_id: Optional[str] = None) -> AgentPackage:
@@ -102,34 +99,11 @@ class PackageLoader:
                 if final_path.exists():
                     logger.warning("Package already exists, replacing", package_id=package_id)
                     shutil.rmtree(final_path)
-
-                try:
-                    shutil.move(temp_dir, str(final_path))
-                except PermissionError as e:
-                    raise PackageLoadError(
-                        f"Permission denied when moving package to {final_path}. "
-                        f"This usually indicates {self.packages_dir} has incorrect permissions. "
-                        f"Ensure it exists with mode 1777 (drwxrwxrwt). Original error: {e}"
-                    ) from e
+                
+                shutil.move(temp_dir, str(final_path))
 
                 # Create or reuse virtual environment
                 venv_path = self._ensure_venv(package_id, final_path, agent_app_id)
-
-                # Read deploy.json and merge environment variables
-                deploy_data = self._read_deploy_json(final_path)
-                deploy_env = deploy_data.get("environment", {})
-
-                # Merge environment: agent.yaml < deploy.json (deploy.json takes precedence)
-                merged_env = {**manifest.environment, **deploy_env}
-
-                if merged_env:
-                    logger.info(
-                        "Merged environment variables from agent.yaml and deploy.json",
-                        package_id=package_id,
-                        agent_yaml_vars=len(manifest.environment),
-                        deploy_json_vars=len(deploy_env),
-                        total_vars=len(merged_env)
-                    )
 
                 # Create package instance
                 package = AgentPackage(
@@ -139,8 +113,7 @@ class PackageLoader:
                     url=f"https://local.pixell.runtime/packages/{package_id}",  # Use a placeholder URL
                     sha256=sha256,
                     status=AgentStatus.LOADING,
-                    venv_path=str(venv_path),  # Add venv path
-                    environment=merged_env  # Add merged environment
+                    venv_path=str(venv_path)  # Add venv path
                 )
 
                 logger.info("Package loaded successfully", package_id=package_id, venv=venv_path.name)
@@ -202,22 +175,6 @@ class PackageLoader:
                     logger.warning("No agent_app_id or venv path provided for directory load, creating venv")
                     venv_path = self._ensure_venv(package_id, package_dir, agent_app_id)
 
-            # Read deploy.json and merge environment variables
-            deploy_data = self._read_deploy_json(package_dir)
-            deploy_env = deploy_data.get("environment", {})
-
-            # Merge environment: agent.yaml < deploy.json (deploy.json takes precedence)
-            merged_env = {**manifest.environment, **deploy_env}
-
-            if merged_env:
-                logger.info(
-                    "Merged environment variables from agent.yaml and deploy.json",
-                    package_id=package_id,
-                    agent_yaml_vars=len(manifest.environment),
-                    deploy_json_vars=len(deploy_env),
-                    total_vars=len(merged_env)
-                )
-
             # Create package instance (no SHA256 since we don't have the original APKG file)
             package = AgentPackage(
                 id=package_id,
@@ -226,8 +183,7 @@ class PackageLoader:
                 url=f"https://local.pixell.runtime/packages/{package_id}",
                 sha256="",  # Not available for directory loads
                 status=AgentStatus.LOADING,
-                venv_path=str(venv_path),
-                environment=merged_env  # Add merged environment
+                venv_path=str(venv_path)
             )
 
             logger.info("Package loaded from directory", package_id=package_id, venv=venv_path.name)
@@ -355,44 +311,8 @@ class PackageLoader:
             dependencies=manifest_data.get("dependencies", []),
             a2a=a2a_config,
             rest=rest_config,
-            ui=ui_config,
-            environment=manifest_data.get("environment", {})
+            ui=ui_config
         )
-
-    def _read_deploy_json(self, package_path: Path) -> Dict[str, Any]:
-        """Read deploy.json from extracted package.
-
-        Args:
-            package_path: Path to extracted package directory
-
-        Returns:
-            Dictionary containing deploy.json data, or empty dict if file doesn't exist
-        """
-        deploy_json_path = package_path / "deploy.json"
-
-        if not deploy_json_path.exists():
-            logger.debug("No deploy.json found in package", path=str(package_path))
-            return {}
-
-        try:
-            with open(deploy_json_path) as f:
-                deploy_data = json.load(f)
-            logger.info("Loaded deploy.json from package", path=str(deploy_json_path))
-            return deploy_data
-        except json.JSONDecodeError as e:
-            logger.warning(
-                "Failed to parse deploy.json, skipping",
-                path=str(deploy_json_path),
-                error=str(e)
-            )
-            return {}
-        except Exception as e:
-            logger.warning(
-                "Error reading deploy.json, skipping",
-                path=str(deploy_json_path),
-                error=str(e)
-            )
-            return {}
 
     def _safe_extract_zip(self, zf: zipfile.ZipFile, dest_dir: Path):
         """Safely extract a zipfile to dest_dir, preventing zip-slip.
