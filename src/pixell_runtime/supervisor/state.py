@@ -6,6 +6,7 @@ import subprocess
 import zipfile
 import json
 import os
+import re
 import yaml
 from datetime import datetime
 from pathlib import Path
@@ -135,6 +136,15 @@ class SupervisorState:
                 error=str(e),
                 note="Agents may fail to extract packages"
             )
+
+    def _sanitize_dir_name(self, value: str, fallback: str) -> str:
+        """Convert arbitrary identifier into filesystem-safe directory name."""
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", value or "")
+        safe = safe.strip("_")
+        if not safe:
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", fallback or "")
+            safe = safe.strip("_")
+        return safe or "package"
 
     def start_background_tasks(self) -> None:
         """Start background tasks (zombie reaper, etc.).
@@ -505,11 +515,12 @@ class SupervisorState:
                 org_short_id=request.org_short_id,
                 agent_short_id=request.agent_short_id
             )
-            self.user_manager.ensure_directories(
+            directories = self.user_manager.ensure_directories(
                 agent_app_id,
                 org_short_id=request.org_short_id,
                 agent_short_id=request.agent_short_id
             )
+            packages_dir = directories.get("packages", Path(home_dir) / "packages")
 
             logger.info("Created Linux user", agent_app_id=agent_app_id, user=username)
 
@@ -570,32 +581,23 @@ class SupervisorState:
             )
             logger.info("Downloaded package", agent_app_id=agent_app_id, path=str(apkg_path))
 
-            # Step 4: Extract and load package with PackageLoader
-            # Extract to user-specific directory
-            extract_path = self.extract_dir / agent_app_id
+            # Step 4: Extract package into agent's home directory packages folder
+            extract_suffix = request.deployment_id or agent_app_id
+            safe_suffix = self._sanitize_dir_name(extract_suffix, agent_app_id)
+            extract_path = packages_dir / safe_suffix
             if extract_path.exists():
-                logger.info("Package already extracted, removing old extraction", agent_app_id=agent_app_id)
-                import shutil
                 shutil.rmtree(extract_path)
-            
-            # Extract APKG
             extract_path.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(apkg_path, 'r') as zf:
                 zf.extractall(extract_path)
-            logger.info("Extracted package", agent_app_id=agent_app_id, path=str(extract_path))
-
-            # Step 3.5: Extract .apkg (ZIP) to directory (Issue #18 fix)
-            # PAR needs to extract the ZIP before reading config files like deploy.json
-            extracted_dir = self.package_downloader.extract_package(
-                package_path,
-                package_sha256=request.package_sha256,
+            subprocess.run(
+                ["chown", "-R", f"{username}:{username}", str(extract_path)],
+                capture_output=True,
+                text=True,
+                check=True,
             )
-
-            logger.info(
-                "Extracted package",
-                agent_app_id=agent_app_id,
-                extracted_dir=str(extracted_dir)
-            )
+            agent_process.package_path = str(extract_path)
+            extracted_dir = extract_path
 
             # Step 3.6: Inject PAC environment into deploy.json (if provided)
             if request.env:
@@ -746,53 +748,6 @@ class SupervisorState:
 
             logger.info("Downloaded new package", agent_app_id=agent_app_id)
 
-            # Extract .apkg (ZIP) to directory (Issue #18 fix)
-            extracted_dir = self.package_downloader.extract_package(
-                package_path,
-                package_sha256=request.package_sha256,
-                force_extract=True,  # Force re-extraction for updates
-            )
-
-            logger.info(
-                "Extracted new package",
-                agent_app_id=agent_app_id,
-                extracted_dir=str(extracted_dir)
-            )
-
-            # Inject PAC environment into deploy.json (if provided)
-            if request.env:
-                deploy_json_path = extracted_dir / "deploy.json"
-
-                # Read existing deploy.json from extracted package
-                existing_deploy = {}
-                if deploy_json_path.exists():
-                    try:
-                        with open(deploy_json_path) as f:
-                            existing_deploy = json.load(f)
-                    except json.JSONDecodeError as e:
-                        logger.warning(
-                            "Failed to parse existing deploy.json, using empty config",
-                            agent_app_id=agent_app_id,
-                            error=str(e)
-                        )
-
-                # Merge: existing config + PAC environment (PAC takes precedence)
-                deploy_config = {
-                    **existing_deploy,
-                    "environment": request.env
-                }
-
-                # Write merged config back to deploy.json
-                with open(deploy_json_path, 'w') as f:
-                    json.dump(deploy_config, f, indent=2)
-
-                logger.info(
-                    "Injected PAC environment into deploy.json",
-                    agent_app_id=agent_app_id,
-                    env_var_count=len(request.env),
-                    env_var_keys=list(request.env.keys())
-                )
-
             # Stop old process
             if self.process_manager.is_running(agent_app_id):
                 self.process_manager.stop_agent(agent_app_id)
@@ -801,7 +756,11 @@ class SupervisorState:
             # Extract and load new package
             username = agent_process.linux_user
             home_dir = self.user_manager.get_home_dir(agent_app_id)
-            extract_path = self.extract_dir / agent_app_id
+            directories = self.user_manager.ensure_directories(agent_app_id)
+            packages_dir = directories.get("packages", Path(home_dir) / "packages")
+            extract_suffix = request.deployment_id or agent_app_id
+            safe_suffix = self._sanitize_dir_name(extract_suffix, agent_app_id)
+            extract_path = packages_dir / safe_suffix
             
             # Remove old extraction if exists
             if extract_path.exists():
@@ -821,6 +780,33 @@ class SupervisorState:
                 text=True,
                 check=True,
             )
+            extracted_dir = extract_path
+
+            if request.env:
+                deploy_json_path = extracted_dir / "deploy.json"
+                existing_deploy = {}
+                if deploy_json_path.exists():
+                    try:
+                        with open(deploy_json_path) as f:
+                            existing_deploy = json.load(f)
+                    except json.JSONDecodeError as e:
+                        logger.warning(
+                            "Failed to parse existing deploy.json, using empty config",
+                            agent_app_id=agent_app_id,
+                            error=str(e)
+                        )
+                deploy_config = {
+                    **existing_deploy,
+                    "environment": request.env
+                }
+                with open(deploy_json_path, 'w') as f:
+                    json.dump(deploy_config, f, indent=2)
+                logger.info(
+                    "Injected PAC environment into deploy.json",
+                    agent_app_id=agent_app_id,
+                    env_var_count=len(request.env),
+                    env_var_keys=list(request.env.keys())
+                )
 
             # Load package and create/update virtual environment
             venvs_dir = home_dir / "venvs"
@@ -875,7 +861,7 @@ class SupervisorState:
                                 )
 
             loader = PackageLoader(
-                packages_dir=self.extract_dir,
+                packages_dir=packages_dir,
                 venvs_dir=venvs_dir,
             )
             

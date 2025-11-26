@@ -51,7 +51,7 @@ class LinuxUserManager:
             return f"agent_{org_short_id}_{agent_short_id}"
 
         # LEGACY: Sanitize agent_app_id: replace hyphens with underscores for valid Linux usernames
-        sanitized_id = agent_app_id.replace("-", "_")
+        sanitized_id = "_".join(agent_app_id.split("-")[0:2])
         return f"agent_{sanitized_id}"
 
     def get_home_dir(self, agent_app_id: str, org_short_id: Optional[str] = None, agent_short_id: Optional[str] = None) -> Path:

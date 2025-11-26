@@ -34,7 +34,8 @@ class ProcessManager:
         """
         self.graceful_shutdown_timeout_sec = graceful_shutdown_timeout_sec
         self.processes: Dict[str, subprocess.Popen] = {}  # agent_app_id -> Popen
-        self.log_files: Dict[str, 'IO[str]'] = {}  # agent_app_id -> log file handle
+        self.log_files: Dict[str, IO] = {}  # agent_app_id -> log file handle
+        self._log_threads: Dict[str, list] = {}
         logger.info(
             "ProcessManager initialized",
             graceful_shutdown_timeout_sec=graceful_shutdown_timeout_sec,
@@ -222,24 +223,11 @@ class ProcessManager:
                 preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
             )
 
-            if log_file_handle:
-                try:
-                    log_file_handle.write(f"[supervisor] agent {agent_app_id} started pid={process.pid}\n")
-                    log_file_handle.flush()
-                except Exception:
-                    pass
-            
             # Store process reference
             self.processes[agent_app_id] = process
             
-            # If we're using PIPE for stdout, start background thread to forward to log file
-            # stderr is already redirected to log file if stderr_file is set
-            if log_file_path and stdout_target == subprocess.PIPE:
-                self._start_log_forwarding(agent_app_id, process, log_file_path, stdout_target, stderr_target)
-            
             # Store log file handle so it can be closed when process stops
-            if log_file_handle:
-                self._log_file_handles[agent_app_id] = log_file_handle
+            self.log_files[agent_app_id] = log_handle
 
             logger.info(
                 "Agent process spawned",
@@ -615,12 +603,12 @@ class ProcessManager:
                 del self._log_threads[agent_app_id]
             
             # Close log file handle if it was opened
-            if agent_app_id in self._log_file_handles:
+            if agent_app_id in self.log_files:
                 try:
-                    self._log_file_handles[agent_app_id].close()
+                    self.log_files[agent_app_id].close()
                 except Exception:
                     pass
-                del self._log_file_handles[agent_app_id]
+                del self.log_files[agent_app_id]
             
             # Clean up
             # Close log file if open
