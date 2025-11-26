@@ -286,12 +286,16 @@ class ProcessManager:
                     python_exec=python_exec,
                 )
 
-        # Convert env dict to string for shell
-        env_string = " ".join([f"{k}={v}" for k, v in process_env.items()])
+        # Convert env dict to string for shell (KEY=VALUE prefix)
+        env_string = " ".join([f"{k}={v}" for k, v in process_env.items() if v is not None])
+        if env_string:
+            env_string = f"{env_string} "
 
         # Command to run as different user
         # su - <user> -s /bin/bash -c "export ENV_VARS && <python_exec> -m pixell_runtime"
         # Note: Using full path or python3 ensures it's found even with minimal PATH
+        shell_command = f"exec {env_string}{python_exec} -m pixell_runtime".strip()
+
         cmd = [
             "su",
             "-",
@@ -299,7 +303,7 @@ class ProcessManager:
             "-s",
             "/bin/bash",
             "-c",
-            f"{env_string} {python_exec} -m pixell_runtime",
+            shell_command,
         ]
 
         try:
