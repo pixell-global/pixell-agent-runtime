@@ -42,6 +42,22 @@ class ProcessManager:
             graceful_shutdown_timeout_sec=graceful_shutdown_timeout_sec,
         )
 
+    def _signal_process_group(self, process: subprocess.Popen, sig: int) -> bool:
+        """Send signal to process group rooted at process pid."""
+        try:
+            os.killpg(process.pid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except Exception as e:
+            logger.warning(
+                "Failed to signal process group",
+                pid=process.pid,
+                signal=sig,
+                error=str(e),
+            )
+            return False
+
     def spawn_agent(
         self,
         agent_app_id: str,
@@ -315,11 +331,21 @@ class ProcessManager:
                     stderr_target = subprocess.PIPE
             
             # Spawn process
+            def _preexec():
+                try:
+                    os.setsid()
+                except Exception:
+                    pass
+                try:
+                    signal.signal(signal.SIGINT, signal.SIG_IGN)
+                except Exception:
+                    pass
+
             process = subprocess.Popen(
                 cmd,
                 stdout=stdout_target,
                 stderr=stderr_target,
-                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
+                preexec_fn=_preexec,
             )
 
             if log_file_handle:
@@ -423,7 +449,8 @@ class ProcessManager:
             if force:
                 # Force kill
                 logger.info("Force killing agent process", agent_app_id=agent_app_id, pid=pid)
-                process.kill()
+                if not self._signal_process_group(process, signal.SIGKILL):
+                    process.kill()
                 process.wait(timeout=5)
             else:
                 # Graceful shutdown
@@ -433,7 +460,8 @@ class ProcessManager:
                     pid=pid,
                     timeout=timeout,
                 )
-                process.terminate()
+                if not self._signal_process_group(process, signal.SIGTERM):
+                    process.terminate()
 
                 # Wait for graceful shutdown
                 try:
@@ -446,7 +474,8 @@ class ProcessManager:
                         agent_app_id=agent_app_id,
                         pid=pid,
                     )
-                    process.kill()
+                    if not self._signal_process_group(process, signal.SIGKILL):
+                        process.kill()
                     process.wait(timeout=5)
 
             # Clean up log forwarding threads
