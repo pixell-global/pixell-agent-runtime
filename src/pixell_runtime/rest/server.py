@@ -133,6 +133,15 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
         }
 
     # Also expose a top-level health alias for runtime checks regardless of base path
+    def _empty_surfaces(status: bool) -> dict:
+        """Build surface map limited to configured surfaces."""
+        surfaces = {"rest": status}
+        if package and package.manifest.a2a:
+            surfaces["a2a"] = status
+        if package and package.manifest.ui and package.manifest.ui.path:
+            surfaces["ui"] = status
+        return surfaces
+
     @app.get("/health")
     async def _top_health_alias():
         # Delegate to built-in health handler by calling function directly
@@ -142,7 +151,7 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
             if not getattr(app.state, "runtime_ready", False):
                 return JSONResponse({
                     "ok": False,
-                    "surfaces": {"rest": False, "a2a": False, "ui": False},
+                    "surfaces": _empty_surfaces(False),
                     "timestamp": int(time.time() * 1000)
                 }, status_code=503)
         except Exception:
@@ -168,7 +177,12 @@ def create_rest_app(package: Optional[AgentPackage] = None, base_path: Optional[
                 ui_ok = (ui_path / "index.html").exists()
             except Exception:
                 ui_ok = False
-        return {"ok": True, "surfaces": {"rest": True, "a2a": a2a_ok, "ui": ui_ok}}
+        surfaces = {"rest": True}
+        if package and package.manifest.a2a:
+            surfaces["a2a"] = a2a_ok
+        if package and package.manifest.ui and package.manifest.ui.path:
+            surfaces["ui"] = ui_ok
+        return {"ok": True, "surfaces": surfaces}
 
     @app.get("/ui/health")
     async def _top_ui_health_alias():
@@ -516,6 +530,15 @@ def setup_builtin_endpoints(router: APIRouter, package: Optional[AgentPackage] =
         main_app: Main FastAPI application for accessing app.state
     """
 
+    def _surface_template(status: bool) -> dict:
+        """Helper to map only configured surfaces."""
+        surfaces = {"rest": status}
+        if package and package.manifest.a2a:
+            surfaces["a2a"] = status
+        if package and package.manifest.ui and package.manifest.ui.path:
+            surfaces["ui"] = status
+        return surfaces
+
     @router.get("/agents/{agent_id}/health")
     async def agent_health_check(agent_id: str):
         """Health check endpoint for a specific agent.
@@ -575,7 +598,7 @@ def setup_builtin_endpoints(router: APIRouter, package: Optional[AgentPackage] =
             if main_app and not getattr(main_app.state, "runtime_ready", False):
                 return JSONResponse({
                     "ok": False,
-                    "surfaces": {"rest": False, "a2a": False, "ui": False},
+                    "surfaces": _surface_template(False),
                     "timestamp": int(time.time() * 1000)
                 }, status_code=503)
         except Exception:
@@ -604,11 +627,11 @@ def setup_builtin_endpoints(router: APIRouter, package: Optional[AgentPackage] =
             except Exception:
                 ui_ok = False
 
-        surfaces = {
-            "rest": True,
-            "a2a": a2a_ok,
-            "ui": ui_ok
-        }
+        surfaces = {"rest": True}
+        if package and package.manifest.a2a:
+            surfaces["a2a"] = a2a_ok
+        if package and package.manifest.ui and package.manifest.ui.path:
+            surfaces["ui"] = ui_ok
         
         return {
             "ok": True,
