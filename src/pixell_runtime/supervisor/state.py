@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Union
 import structlog
+from dotenv import dotenv_values
 
 from pixell_runtime.supervisor.models import (
     AgentProcess,
@@ -31,6 +32,8 @@ logger = structlog.get_logger()
 
 
 class SupervisorState:
+    _PLACEHOLDER_PATTERN = re.compile(r"\$\{([^}]+)\}")
+
     """Manages supervisor state and orchestrates agent lifecycle.
 
     Responsibilities:
@@ -171,51 +174,170 @@ class SupervisorState:
         if isinstance(package_path, str):
             package_path = Path(package_path)
 
-        agent_env = {}
-        deploy_env = {}
+        file_env = self._load_env_file(package_path)
+        agent_env = self._load_agent_yaml_env(package_path)
+        deploy_env = self._load_deploy_json_env(package_path)
 
-        # Read agent.yaml
+        # Merge precedence: .env < agent.yaml < deploy.json
+        merged_env = {**file_env, **agent_env, **deploy_env}
+
+        if not merged_env:
+            return merged_env
+
+        resolved_env = self._resolve_env_placeholders(
+            merged_env,
+            extra_sources={**file_env, **os.environ}
+        )
+
+        logger.debug(
+            "Resolved package environment variables",
+            path=str(package_path),
+            env_count=len(resolved_env)
+        )
+
+        return resolved_env
+
+    def _load_env_file(self, package_path: Path) -> Dict[str, str]:
+        """Load environment variables from .env file if present."""
+        env_path = package_path / ".env"
+        if not env_path.exists():
+            return {}
+
+        try:
+            values = {
+                key: value
+                for key, value in (dotenv_values(env_path) or {}).items()
+                if value is not None
+            }
+            logger.debug(
+                "Loaded environment from .env file",
+                path=str(env_path),
+                env_count=len(values)
+            )
+            return values
+        except Exception as e:
+            logger.warning(
+                "Failed to load environment from .env file",
+                path=str(env_path),
+                error=str(e)
+            )
+            return {}
+
+    def _load_agent_yaml_env(self, package_path: Path) -> Dict[str, str]:
+        """Load environment section from agent.yaml."""
         agent_yaml_path = package_path / "agent.yaml"
-        if agent_yaml_path.exists():
-            try:
-                with open(agent_yaml_path) as f:
-                    agent_data = yaml.safe_load(f)
-                    agent_env = agent_data.get("environment", {})
-                    logger.debug(
-                        "Loaded environment from agent.yaml",
-                        path=str(agent_yaml_path),
-                        env_count=len(agent_env)
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Failed to load environment from agent.yaml",
+        if not agent_yaml_path.exists():
+            return {}
+
+        try:
+            with open(agent_yaml_path) as f:
+                agent_data = yaml.safe_load(f) or {}
+                env_data = agent_data.get("environment", {}) or {}
+                logger.debug(
+                    "Loaded environment from agent.yaml",
                     path=str(agent_yaml_path),
-                    error=str(e)
+                    env_count=len(env_data)
                 )
+                return env_data
+        except Exception as e:
+            logger.warning(
+                "Failed to load environment from agent.yaml",
+                path=str(agent_yaml_path),
+                error=str(e)
+            )
+            return {}
 
-        # Read deploy.json
+    def _load_deploy_json_env(self, package_path: Path) -> Dict[str, str]:
+        """Load environment section from deploy.json."""
         deploy_json_path = package_path / "deploy.json"
-        if deploy_json_path.exists():
-            try:
-                with open(deploy_json_path) as f:
-                    deploy_data = json.load(f)
-                    deploy_env = deploy_data.get("environment", {})
-                    logger.debug(
-                        "Loaded environment from deploy.json",
-                        path=str(deploy_json_path),
-                        env_count=len(deploy_env)
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Failed to load environment from deploy.json",
+        if not deploy_json_path.exists():
+            return {}
+
+        try:
+            with open(deploy_json_path) as f:
+                deploy_data = json.load(f) or {}
+                env_data = deploy_data.get("environment", {}) or {}
+                logger.debug(
+                    "Loaded environment from deploy.json",
                     path=str(deploy_json_path),
-                    error=str(e)
+                    env_count=len(env_data)
                 )
+                return env_data
+        except Exception as e:
+            logger.warning(
+                "Failed to load environment from deploy.json",
+                path=str(deploy_json_path),
+                error=str(e)
+            )
+            return {}
 
-        # Merge: agent.yaml < deploy.json (deploy.json takes precedence)
-        merged_env = {**agent_env, **deploy_env}
+    def _resolve_env_placeholders(
+        self,
+        env_values: Dict[str, str],
+        extra_sources: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """Resolve ${VAR} placeholders using provided sources.
 
-        return merged_env
+        Args:
+            env_values: Environment variables to resolve.
+            extra_sources: Additional lookup sources (e.g., .env file, os.environ).
+        """
+        extra_sources = extra_sources or {}
+        resolved: Dict[str, str] = {}
+
+        def _resolve(key: str, chain: Optional[list] = None) -> Optional[str]:
+            if key in resolved:
+                return resolved[key]
+
+            chain = (chain or []) + [key]
+            value = env_values.get(key)
+
+            if value is None:
+                return None
+
+            if not isinstance(value, str):
+                resolved[key] = value
+                return value
+
+            def _replace(match: re.Match) -> str:
+                var_name = match.group(1).strip()
+
+                if var_name in extra_sources:
+                    return str(extra_sources[var_name])
+
+                if var_name in os.environ:
+                    return os.environ[var_name]
+
+                if var_name in chain:
+                    logger.warning(
+                        "Detected circular environment placeholder reference",
+                        variable=var_name,
+                        chain=" -> ".join(chain + [var_name])
+                    )
+                    return match.group(0)
+
+                if var_name in env_values:
+                    nested = _resolve(var_name, chain)
+                    return "" if nested is None else str(nested)
+
+                logger.debug(
+                    "Placeholder value not found for environment variable",
+                    variable=var_name,
+                    referenced_by=key
+                )
+                return match.group(0)
+
+            new_value = self._PLACEHOLDER_PATTERN.sub(_replace, value)
+            resolved[key] = new_value
+            return new_value
+
+        final: Dict[str, str] = {}
+        for key in env_values.keys():
+            resolved_value = _resolve(key, [])
+            if resolved_value is not None:
+                final[key] = resolved_value
+
+        return final
 
     def _cleanup_process_manager_state(self, agent_app_id: str, pid: Optional[int]) -> None:
         """Clean up process manager state for dead/zombie processes.
