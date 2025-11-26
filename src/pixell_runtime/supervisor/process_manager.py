@@ -9,7 +9,7 @@ import sys
 import time
 import threading
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, IO
 import structlog
 
 from pixell_runtime.supervisor.models import AgentProcess, AgentStatus, Ports
@@ -36,7 +36,7 @@ class ProcessManager:
         self.graceful_shutdown_timeout_sec = graceful_shutdown_timeout_sec
         self.processes: Dict[str, subprocess.Popen] = {}  # agent_app_id -> Popen
         self._log_threads: Dict[str, list] = {}  # agent_app_id -> list of threads
-        self._stderr_files: Dict[str, any] = {}  # agent_app_id -> stderr file handle
+        self._log_file_handles: Dict[str, IO] = {}  # agent_app_id -> open log file handle
         logger.info(
             "ProcessManager initialized",
             graceful_shutdown_timeout_sec=graceful_shutdown_timeout_sec,
@@ -292,21 +292,22 @@ class ProcessManager:
             # This ensures we get logs even if process crashes before logging initializes
             stdout_target = subprocess.PIPE
             stderr_target = subprocess.PIPE
-            stderr_file = None
+            log_file_handle: Optional[IO] = None
             
             if log_file_path:
                 try:
-                    # Open log file in append mode with line buffering
-                    stderr_file = open(log_file_path, "a", buffering=1)
-                    stderr_target = stderr_file
+                    # Open log file in append mode with line buffering and redirect both streams directly
+                    log_file_handle = open(log_file_path, "a", buffering=1)
+                    stdout_target = log_file_handle
+                    stderr_target = log_file_handle
                     logger.debug(
-                        "Redirecting stderr to log file",
+                        "Redirecting stdout/stderr to log file",
                         agent_app_id=agent_app_id,
                         log_file=str(log_file_path),
                     )
                 except Exception as e:
                     logger.warning(
-                        "Could not open log file for stderr redirection, using PIPE",
+                        "Could not open log file for stream redirection, using PIPE",
                         agent_app_id=agent_app_id,
                         log_file=str(log_file_path),
                         error=str(e),
@@ -320,6 +321,13 @@ class ProcessManager:
                 stderr=stderr_target,
                 preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
             )
+
+            if log_file_handle:
+                try:
+                    log_file_handle.write(f"[supervisor] agent {agent_app_id} started pid={process.pid}\n")
+                    log_file_handle.flush()
+                except Exception:
+                    pass
             
             # Store process reference
             self.processes[agent_app_id] = process
@@ -329,9 +337,9 @@ class ProcessManager:
             if log_file_path and stdout_target == subprocess.PIPE:
                 self._start_log_forwarding(agent_app_id, process, log_file_path, stdout_target, stderr_target)
             
-            # Store stderr_file reference so it can be closed when process stops
-            if stderr_file:
-                self._stderr_files[agent_app_id] = stderr_file
+            # Store log file handle so it can be closed when process stops
+            if log_file_handle:
+                self._log_file_handles[agent_app_id] = log_file_handle
 
             logger.info(
                 "Agent process spawned",
@@ -445,13 +453,13 @@ class ProcessManager:
             if agent_app_id in self._log_threads:
                 del self._log_threads[agent_app_id]
             
-            # Close stderr file if it was opened
-            if agent_app_id in self._stderr_files:
+            # Close log file handle if it was opened
+            if agent_app_id in self._log_file_handles:
                 try:
-                    self._stderr_files[agent_app_id].close()
+                    self._log_file_handles[agent_app_id].close()
                 except Exception:
                     pass
-                del self._stderr_files[agent_app_id]
+                del self._log_file_handles[agent_app_id]
             
             # Clean up
             del self.processes[agent_app_id]
@@ -660,10 +668,10 @@ class ProcessManager:
         self.stop_all(force=True)
         # Clean up log threads
         self._log_threads.clear()
-        # Close any remaining stderr files
-        for agent_app_id, stderr_file in list(self._stderr_files.items()):
+        # Close any remaining log file handles
+        for agent_app_id, log_handle in list(self._log_file_handles.items()):
             try:
-                stderr_file.close()
+                log_handle.close()
             except Exception:
                 pass
-        self._stderr_files.clear()
+        self._log_file_handles.clear()
