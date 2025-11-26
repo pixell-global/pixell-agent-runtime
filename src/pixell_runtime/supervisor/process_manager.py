@@ -536,7 +536,13 @@ class ProcessManager:
                     response_data = {"raw_text": response.text[:200]}  # Truncate if too long
 
                 if response.status_code == 200:
+                    status_ok = False
                     if response_data.get("status") == "healthy":
+                        status_ok = True
+                    elif isinstance(response_data.get("ok"), bool):
+                        status_ok = response_data.get("ok") is True
+
+                    if status_ok:
                         logger.info(
                             "Agent health check passed",
                             agent_app_id=agent_app_id,
