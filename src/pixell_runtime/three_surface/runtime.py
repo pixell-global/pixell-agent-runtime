@@ -72,6 +72,8 @@ class ThreeSurfaceRuntime:
         self._rest_server: Optional[uvicorn.Server] = None
         self._ui_server: Optional[uvicorn.Server] = None
         self._http_a2a_server: Optional[uvicorn.Server] = None
+        self._runtime_ready_signaled: bool = False
+        self._boot_metrics_finalized: bool = False
 
         # Validate and load configuration
         from pixell_runtime.core.runtime_config import RuntimeConfig
@@ -128,6 +130,72 @@ class ThreeSurfaceRuntime:
         except Exception:
             # Ignore in environments where signal registration is not allowed
             pass
+
+    def _mark_runtime_ready(self, source: str) -> None:
+        """Flip runtime readiness flag (idempotent)."""
+        if self._runtime_ready_signaled:
+            logger.debug("Runtime readiness already signaled", source=source)
+            return
+
+        if self.rest_app is None:
+            logger.debug("REST app not initialized; cannot mark ready yet", source=source)
+            return
+
+        stats = {}
+        boot_ms = 0.0
+        boot_metrics = getattr(self, "_boot_metrics", None)
+        if boot_metrics is not None:
+            try:
+                if not self._boot_metrics_finalized:
+                    boot_metrics.finish()
+                    self._boot_metrics_finalized = True
+                stats = boot_metrics.to_dict()
+                boot_ms = float(stats.get("total_ms") or 0.0)
+            except Exception:
+                stats = {}
+                boot_ms = 0.0
+
+        try:
+            self.rest_app.state.boot_stats = stats
+        except Exception:
+            pass
+
+        try:
+            self.rest_app.state.runtime_ready = True
+        except Exception as exc:
+            logger.warning(
+                "Failed to set runtime readiness flag",
+                source=source,
+                error=str(exc),
+            )
+            return
+
+        self._runtime_ready_signaled = True
+
+        logger.info(
+            "Runtime ready",
+            source=source,
+            rest_port=self.rest_port,
+            a2a_port=self.a2a_port,
+            boot_ms=round(boot_ms, 3),
+        )
+
+        try:
+            budget_ms = float(self.boot_budget_ms)
+        except Exception:
+            budget_ms = 0.0
+
+        if boot_ms and budget_ms and boot_ms > budget_ms:
+            logger.warning("Boot time exceeded budget", boot_ms=boot_ms, budget_ms=budget_ms)
+            try:
+                hard_multiplier = float(self.boot_hard_limit_multiplier or 0.0)
+            except Exception:
+                hard_multiplier = 0.0
+            if hard_multiplier > 0:
+                hard_limit_ms = budget_ms * hard_multiplier
+                if boot_ms > hard_limit_ms:
+                    logger.error("Boot time exceeded hard limit", boot_ms=boot_ms, hard_limit_ms=hard_limit_ms)
+                    _exit_with_backoff(1)
 
     def _validate_package_url(self, url: str) -> None:
         """Validate PACKAGE_URL for security.
@@ -668,6 +736,7 @@ class ThreeSurfaceRuntime:
                 self._boot_metrics.end_phase("a2a_http")
                 
             logger.info("A2A HTTP server started", port=self.a2a_port)
+            self._mark_runtime_ready("http_a2a")
             
         except Exception as e:
             logger.error("Failed to start A2A HTTP server", error=str(e), exc_info=True)
@@ -719,38 +788,10 @@ class ThreeSurfaceRuntime:
                     if test_delay_ms > 0:
                         await asyncio.sleep(test_delay_ms / 1000.0)
 
-                    # Finalize metrics and stash to app.state for /meta
                     if hasattr(self, "_boot_metrics"):
                         self._boot_metrics.end_phase("a2a")
-                        self._boot_metrics.finish()
-                        stats = self._boot_metrics.to_dict()
-                        boot_ms = float(stats.get("total_ms") or 0.0)
-                    else:
-                        stats = {}
-                        boot_ms = 0.0
-                    
-                    # Store boot stats in REST app state for /meta endpoint
-                    if self.rest_app is not None:
-                        try:
-                            self.rest_app.state.boot_stats = stats
-                        except Exception:
-                            pass
 
-                    logger.info("Runtime ready", rest_port=self.rest_port, a2a_port=self.a2a_port, boot_ms=round(boot_ms, 3))
-                    budget_ms = float(self.boot_budget_ms)
-                    if boot_ms > budget_ms:
-                        logger.warning("Boot time exceeded budget", boot_ms=boot_ms, budget_ms=budget_ms)
-                        # Enforce hard limit if configured
-                        hard_multiplier = float(self.boot_hard_limit_multiplier or 0.0)
-                        if hard_multiplier > 0:
-                            hard_limit_ms = budget_ms * hard_multiplier
-                            if boot_ms > hard_limit_ms:
-                                logger.error("Boot time exceeded hard limit", boot_ms=boot_ms, hard_limit_ms=hard_limit_ms)
-                                # Fail fast - exit process with backoff
-                                _exit_with_backoff(1)
-                    
-                    if self.rest_app is not None:
-                        self.rest_app.state.runtime_ready = True
+                    self._mark_runtime_ready("grpc")
                 except Exception:
                     pass
         except Exception:
@@ -795,6 +836,7 @@ class ThreeSurfaceRuntime:
         """Start all configured services."""
         from pixell_runtime.utils.boot_metrics import BootMetrics
         self._boot_metrics = BootMetrics()
+        self._boot_metrics_finalized = False
         logger.info("Starting three-surface runtime",
                    multiplexed=self.multiplexed,
                    ports={
@@ -820,12 +862,14 @@ class ThreeSurfaceRuntime:
         rest_task = asyncio.create_task(self.start_rest_server())
         grpc_task = None
         ui_task = None
+        http_a2a_task = None
+        has_a2a = bool(self.package.manifest.a2a)
         
         # Wait a moment for REST app to be created before starting gRPC
         # (gRPC server will store boot_stats in rest_app.state)
         await asyncio.sleep(0.1)
         
-        if self.package.manifest.a2a:
+        if has_a2a:
             # Start HTTP A2A server if configured, otherwise start gRPC server
             if self.package.manifest.a2a.http_server:
                 http_a2a_task = asyncio.create_task(self.start_http_a2a_server())
@@ -838,8 +882,15 @@ class ThreeSurfaceRuntime:
         try:
             # Wait until REST is accepting connections
             await asyncio.sleep(0.2)
-            # Do not flip readiness here. It will be flipped by start_grpc_server()
-            # after gRPC successfully starts (or by REST-only mode elsewhere).
+
+            if not has_a2a and not self._runtime_ready_signaled:
+                # REST-only packages become ready once REST server is up
+                for _ in range(5):
+                    if self.rest_app is not None:
+                        self._mark_runtime_ready("rest")
+                        break
+                    await asyncio.sleep(0.1)
+
             while True:
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
