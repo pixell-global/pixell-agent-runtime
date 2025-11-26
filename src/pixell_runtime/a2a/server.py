@@ -1,14 +1,16 @@
 """A2A gRPC server implementation."""
 
 import asyncio
+import json
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import grpc
 import structlog
 from concurrent import futures
 
 from pixell_runtime.core.models import AgentPackage
+from pixell_runtime.a2a.interceptor import PARRoutingInterceptor
 
 logger = structlog.get_logger()
 
@@ -52,28 +54,149 @@ class AgentServiceImpl:
         return capabilities
     
     async def Invoke(self, request, context):
-        """Invoke an action by forwarding to agent's gRPC server."""
+        """Invoke action - supports both A2A and legacy formats.
+
+        Parses both:
+        1. A2A format: request.message.params_json → message.metadata.skill/params
+        2. Legacy format: request.action/parameters
+
+        For subprocess forwarding, normalizes to legacy format to ensure
+        all agents receive consistent format.
+        """
         from pixell_runtime.proto import agent_pb2, agent_pb2_grpc
 
         start_time = time.time()
-        request_id = request.request_id or f"req_{int(time.time() * 1000)}"
+        action = None
+        parameters = {}
+        request_id = None
 
+        # Parse request format - try A2A first, then legacy
+        try:
+            # Try A2A format first (request.message)
+            if request.HasField("message"):
+                # Parse A2A JSON-RPC 2.0 format
+                a2a_msg = request.message
+                request_id = a2a_msg.id
+
+                logger.debug(
+                    "Received A2A format request",
+                    jsonrpc=a2a_msg.jsonrpc,
+                    method=a2a_msg.method,
+                    request_id=request_id
+                )
+
+                # Parse params_json to extract action and parameters
+                params_data = json.loads(a2a_msg.params_json)
+                message_data = params_data.get("message", {})
+                metadata = message_data.get("metadata", {})
+
+                action = metadata.get("skill")      # Extract from metadata.skill
+                parameters = metadata.get("params", {})
+
+                logger.info(
+                    "Parsed A2A format",
+                    action=action,
+                    has_parameters=bool(parameters),
+                    request_id=request_id
+                )
+
+            # Fall back to legacy format
+            else:
+                action = request.action
+                parameters = dict(request.parameters)
+                request_id = request.request_id or f"req_{int(time.time() * 1000)}"
+
+                logger.debug(
+                    "Received legacy format request",
+                    action=action,
+                    has_parameters=bool(parameters),
+                    request_id=request_id
+                )
+
+        except json.JSONDecodeError as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            error_msg = f"Invalid JSON in A2A params_json: {str(e)}"
+            logger.error("Failed to parse A2A format", error=error_msg, request_id=request_id)
+
+            return agent_pb2.ActionResult(
+                success=False,
+                result="",
+                error=error_msg,
+                request_id=request_id or f"req_{int(time.time() * 1000)}",
+                duration_ms=duration_ms,
+                metadata={}
+            )
+        except Exception as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            error_msg = f"Failed to parse request format: {str(e)}"
+            logger.error("Request parsing failed", error=error_msg, request_id=request_id)
+
+            return agent_pb2.ActionResult(
+                success=False,
+                result="",
+                error=error_msg,
+                request_id=request_id or f"req_{int(time.time() * 1000)}",
+                duration_ms=duration_ms,
+                metadata={}
+            )
+
+        # Validate we have an action
+        if not action:
+            duration_ms = int((time.time() - start_time) * 1000)
+            error_msg = "No action/skill specified in request"
+            logger.error("Missing action", request_id=request_id)
+
+            return agent_pb2.ActionResult(
+                success=False,
+                result="",
+                error=error_msg,
+                request_id=request_id or f"req_{int(time.time() * 1000)}",
+                duration_ms=duration_ms,
+                metadata={}
+            )
+
+        # Now dispatch to handlers based on parsed action
         try:
             # Check for custom handler first
-            if request.action in self.custom_handlers:
-                result = await self.custom_handlers[request.action](request.parameters)
+            if action in self.custom_handlers:
+                logger.info("Invoking custom handler", action=action, request_id=request_id)
+                result = await self.custom_handlers[action](parameters)
                 success = True
                 error = ""
+
             # If agent has its own gRPC server (subprocess mode), forward to it
             elif self.agent_a2a_port:
                 try:
+                    logger.info(
+                        "Forwarding to agent subprocess",
+                        action=action,
+                        port=self.agent_a2a_port,
+                        request_id=request_id
+                    )
+
+                    # CRITICAL: Normalize to legacy format before forwarding
+                    # This ensures all agents receive consistent format regardless
+                    # of whether the client sent A2A or legacy format
+                    legacy_request = agent_pb2.ActionRequest(
+                        action=action,
+                        parameters={k: str(v) for k, v in parameters.items()},
+                        request_id=request_id
+                    )
+
                     # Connect to agent's gRPC server
                     agent_address = f"localhost:{self.agent_a2a_port}"
                     async with grpc.aio.insecure_channel(agent_address) as channel:
                         stub = agent_pb2_grpc.AgentServiceStub(channel)
 
-                        # Forward the request to the agent
-                        agent_response = await stub.Invoke(request, timeout=30)
+                        # Forward the normalized legacy request to the agent
+                        agent_response = await stub.Invoke(legacy_request, timeout=30)
+
+                        logger.info(
+                            "Agent subprocess responded",
+                            action=action,
+                            success=agent_response.success,
+                            request_id=request_id
+                        )
 
                         # Return the agent's response
                         return agent_response
@@ -81,18 +204,25 @@ class AgentServiceImpl:
                 except Exception as forward_error:
                     logger.error(
                         "Failed to forward to agent gRPC server",
-                        action=request.action,
+                        action=action,
                         port=self.agent_a2a_port,
-                        error=str(forward_error)
+                        error=str(forward_error),
+                        request_id=request_id
                     )
                     result = ""
                     success = False
                     error = f"Failed to forward to agent: {str(forward_error)}"
             else:
                 # No custom handler and no agent gRPC server
+                logger.warning(
+                    "No handler found for action",
+                    action=action,
+                    request_id=request_id,
+                    available_handlers=list(self.custom_handlers.keys())
+                )
                 result = ""
                 success = False
-                error = f"No handler found for action: {request.action}"
+                error = f"No handler found for action: {action}"
 
             duration_ms = int((time.time() - start_time) * 1000)
 
@@ -101,19 +231,26 @@ class AgentServiceImpl:
                 result=str(result),
                 error=error,
                 request_id=request_id,
-                duration_ms=duration_ms
+                duration_ms=duration_ms,
+                metadata={}  # Empty metadata for custom handlers (they can add their own)
             )
 
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
-            logger.error("Action invocation failed", action=request.action, error=str(e))
+            logger.error(
+                "Action invocation failed",
+                action=action,
+                error=str(e),
+                request_id=request_id
+            )
 
             return agent_pb2.ActionResult(
                 success=False,
                 result="",
                 error=str(e),
                 request_id=request_id,
-                duration_ms=duration_ms
+                duration_ms=duration_ms,
+                metadata={}  # Empty metadata on error
             )
     
     async def Ping(self, request, context):
@@ -261,7 +398,12 @@ def _load_agent_service(package: AgentPackage) -> tuple:
         return None, "none", None
 
 
-def create_grpc_server(package: Optional[AgentPackage] = None, port: int = 50052, agent_a2a_port: Optional[int] = None) -> grpc.aio.Server:
+def create_grpc_server(
+    package: Optional[AgentPackage] = None,
+    port: int = 50052,
+    agent_a2a_port: Optional[int] = None,
+    agent_id: Optional[str] = None
+) -> grpc.aio.Server:
     """Create and configure gRPC server.
 
     Supports three agent patterns:
@@ -273,6 +415,7 @@ def create_grpc_server(package: Optional[AgentPackage] = None, port: int = 50052
         package: Optional agent package with a2a service
         port: Port to bind the server to (default: 50052)
         agent_a2a_port: Port for forwarding to agent's subprocess gRPC server (Pattern 3)
+        agent_id: Agent app ID for path-based routing interceptor (NEW)
 
     Returns:
         Configured gRPC server
@@ -285,8 +428,29 @@ def create_grpc_server(package: Optional[AgentPackage] = None, port: int = 50052
         sys.path.insert(0, str(pkg_dir))
     from pixell_runtime.proto import agent_pb2_grpc
 
-    # Create server
-    server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
+    # Build interceptor chain
+    interceptors: List[grpc.aio.ServerInterceptor] = []
+
+    if agent_id:
+        # Add PAR routing interceptor (MUST be first in chain!)
+        routing_interceptor = PARRoutingInterceptor(agent_id=agent_id)
+        interceptors.append(routing_interceptor)
+        logger.info(
+            "Added PAR routing interceptor",
+            agent_id=agent_id,
+            prefix=routing_interceptor.prefix
+        )
+    else:
+        logger.warning(
+            "No agent_id provided - routing interceptor not added. "
+            "ALB path-based routing will not work!"
+        )
+
+    # Create server with interceptors
+    server = grpc.aio.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        interceptors=interceptors if interceptors else None
+    )
 
     # Load agent's service (if package provides one)
     agent_service, pattern, handlers = _load_agent_service(package)

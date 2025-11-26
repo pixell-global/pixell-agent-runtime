@@ -65,11 +65,11 @@ def test_supervisor_models_validation():
         AgentStatus,
     )
 
-    # Create valid ports
-    ports = Ports(rest=8081, a2a=50052, ui=3001)
-    assert ports.rest == 8081
-    assert ports.a2a == 50052
-    assert ports.ui == 3001
+    # Create valid ports (NEW: PAC port ranges)
+    ports = Ports(rest=63000, a2a=60000, ui=65000)
+    assert ports.rest == 63000
+    assert ports.a2a == 60000
+    assert ports.ui == 65000
 
     # Test DeployRequest
     request = DeployRequest(
@@ -82,7 +82,7 @@ def test_supervisor_models_validation():
     assert request.agent_app_id == "test123"
     assert request.version == "1.0.0"
     assert request.org_id == "org-123"
-    assert request.boot_budget_ms == 5000  # Default value
+    assert request.boot_budget_ms == 120000  # Default value (2 minutes)
 
     # Test AgentStatus enum
     assert AgentStatus.RUNNING.value == "running"
@@ -90,16 +90,16 @@ def test_supervisor_models_validation():
 
 
 def test_port_allocator_basic():
-    """Test basic port allocation."""
+    """Test basic port allocation (NEW: PAC port ranges)."""
     from pixell_runtime.supervisor.port_allocator import PortAllocator
 
     allocator = PortAllocator()
 
-    # Allocate ports for first agent
+    # Allocate ports for first agent (NEW: PAC ranges)
     ports1 = allocator.allocate("agent1")
-    assert 8081 <= ports1.rest <= 8100
-    assert 50052 <= ports1.a2a <= 50071
-    assert 3001 <= ports1.ui <= 3020
+    assert 63000 <= ports1.rest <= 63199
+    assert 60000 <= ports1.a2a <= 60199
+    assert 65000 <= ports1.ui <= 65199
 
     # Allocate ports for second agent
     ports2 = allocator.allocate("agent2")

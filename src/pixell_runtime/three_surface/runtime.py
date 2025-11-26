@@ -310,11 +310,21 @@ class ThreeSurfaceRuntime:
         logger.info("Loading agent package", path=self.package_path)
 
         # Create package loader
+        # Keep packages_dir in /tmp for sharing between agents (already has 1777 permissions)
         packages_dir = Path("/tmp/pixell_packages")
-        loader = PackageLoader(packages_dir)
 
-        # Load package
-        self.package = loader.load_package(Path(self.package_path))
+        # Use HOME directory for venvs (agent-specific isolation)
+        # This prevents permission conflicts when multiple agents try to create venvs
+        home_dir = Path(os.getenv("HOME", "/tmp"))
+        venvs_dir = home_dir / ".pixell" / "venvs"
+
+        loader = PackageLoader(packages_dir, venvs_dir=venvs_dir)
+
+        # Load package - pass agent_app_id for proper venv naming and isolation
+        self.package = loader.load_package(
+            Path(self.package_path),
+            agent_app_id=self.agent_app_id
+        )
 
         logger.info("Package loaded successfully",
                    package_id=self.package.id,
@@ -757,12 +767,16 @@ class ThreeSurfaceRuntime:
             logger.info("HTTP A2A server configured, skipping gRPC server")
             return
 
-        logger.info("Starting A2A gRPC server", port=self.a2a_port)
+        logger.info("Starting A2A gRPC server", port=self.a2a_port, agent_id=self.agent_app_id)
         if hasattr(self, "_boot_metrics"):
             self._boot_metrics.start_phase("a2a")
 
-        # Create gRPC server
-        self.grpc_server = create_grpc_server(self.package, self.a2a_port)
+        # Create gRPC server with routing interceptor
+        self.grpc_server = create_grpc_server(
+            self.package,
+            self.a2a_port,
+            agent_id=self.agent_app_id  # NEW: Pass agent_id for routing interceptor
+        )
 
         # Start server
         await start_grpc_server(self.grpc_server)

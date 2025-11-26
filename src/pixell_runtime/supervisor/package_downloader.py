@@ -1,7 +1,9 @@
 """Package downloading and caching for supervisor."""
 
 import hashlib
+import shutil
 import structlog
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -25,20 +27,25 @@ class PackageDownloader:
     def __init__(
         self,
         cache_dir: Path = Path("/var/lib/pixell/packages"),
+        extracted_dir: Path = Path("/var/lib/pixell/extracted"),
         max_package_size_mb: int = 100,
     ):
         """Initialize package downloader.
 
         Args:
             cache_dir: Directory for package cache (default: /var/lib/pixell/packages)
+            extracted_dir: Directory for extracted packages (default: /var/lib/pixell/extracted)
             max_package_size_mb: Maximum package size in MB (default: 100)
         """
         self.cache_dir = cache_dir
+        self.extracted_dir = extracted_dir
         self.max_package_size_bytes = max_package_size_mb * 1024 * 1024
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.extracted_dir.mkdir(parents=True, exist_ok=True)
         logger.info(
             "PackageDownloader initialized",
             cache_dir=str(cache_dir),
+            extracted_dir=str(extracted_dir),
             max_size_mb=max_package_size_mb,
         )
 
@@ -191,6 +198,157 @@ class PackageDownloader:
                 exc_info=True,
             )
             raise
+
+    def extract_package(
+        self,
+        apkg_path: Path,
+        package_sha256: Optional[str] = None,
+        force_extract: bool = False,
+    ) -> Path:
+        """Extract .apkg (ZIP) to directory.
+
+        Uses SHA256 for cache key if provided to enable cache invalidation.
+        Extracts to /var/lib/pixell/extracted/{cache_key}/ for persistence.
+
+        Args:
+            apkg_path: Path to .apkg file (ZIP archive)
+            package_sha256: Optional SHA256 checksum for cache key
+            force_extract: If True, extract even if already extracted
+
+        Returns:
+            Path to extracted directory
+
+        Raises:
+            RuntimeError: If extraction fails
+            ValueError: If .apkg is not a valid ZIP file or contains unsafe paths (zip-slip)
+        """
+        # Validate apkg_path exists and is a file
+        if not apkg_path.exists():
+            raise ValueError(f"Package file not found: {apkg_path}")
+        if not apkg_path.is_file():
+            raise ValueError(f"Package path is not a file: {apkg_path}")
+
+        # Generate cache key for extracted directory
+        # Use SHA256 if provided (recommended), otherwise hash the file
+        if package_sha256:
+            cache_key = package_sha256[:16]  # First 16 chars of SHA256
+        else:
+            # Hash file contents to generate stable cache key
+            sha256_hash = hashlib.sha256()
+            with open(apkg_path, "rb") as f:
+                for byte_block in iter(lambda: f.read(4096), b""):
+                    sha256_hash.update(byte_block)
+            cache_key = sha256_hash.hexdigest()[:16]
+
+        extract_dir = self.extracted_dir / cache_key
+
+        # Handle force_extract - clean up existing directory
+        if force_extract and extract_dir.exists():
+            logger.info(
+                "Force extract requested, removing existing extraction",
+                cache_key=cache_key,
+                extract_dir=str(extract_dir),
+            )
+            shutil.rmtree(extract_dir, ignore_errors=True)
+
+        # Skip extraction if already extracted (unless force_extract=True)
+        if not force_extract and extract_dir.exists():
+            # Verify extraction is complete by checking for agent.yaml
+            agent_yaml = extract_dir / "agent.yaml"
+            if agent_yaml.exists():
+                logger.info(
+                    "Package already extracted, reusing",
+                    cache_key=cache_key,
+                    extract_dir=str(extract_dir),
+                )
+                return extract_dir
+            else:
+                # Incomplete extraction - clean up and re-extract
+                logger.warning(
+                    "Extracted directory exists but incomplete, re-extracting",
+                    cache_key=cache_key,
+                    extract_dir=str(extract_dir),
+                )
+                shutil.rmtree(extract_dir, ignore_errors=True)
+
+        logger.info(
+            "Extracting package",
+            apkg_path=str(apkg_path),
+            cache_key=cache_key,
+            extract_dir=str(extract_dir),
+        )
+
+        try:
+            # Create extraction directory
+            extract_dir.mkdir(parents=True, exist_ok=True)
+
+            # Extract with zip-slip protection
+            with zipfile.ZipFile(apkg_path, 'r') as zf:
+                # Validate all paths before extracting (prevent zip-slip attacks)
+                extract_base = extract_dir.resolve()
+                for member in zf.namelist():
+                    member_path = Path(member)
+
+                    # Reject absolute paths
+                    if member_path.is_absolute():
+                        raise ValueError(
+                            f"Zip-slip attack detected: member has absolute path: {member}"
+                        )
+
+                    # Reject parent directory traversals
+                    if ".." in member_path.parts:
+                        raise ValueError(
+                            f"Zip-slip attack detected: member contains '..': {member}"
+                        )
+
+                    # Verify resolved path is within extraction directory
+                    target = (extract_dir / member_path).resolve()
+                    if not str(target).startswith(str(extract_base)):
+                        raise ValueError(
+                            f"Zip-slip attack detected: member escapes extraction directory: {member}"
+                        )
+
+                # All paths validated - safe to extract
+                zf.extractall(extract_dir)
+
+            logger.info(
+                "Package extracted successfully",
+                cache_key=cache_key,
+                extract_dir=str(extract_dir),
+            )
+
+            return extract_dir
+
+        except zipfile.BadZipFile as e:
+            # Clean up partial extraction
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir, ignore_errors=True)
+
+            logger.error(
+                "Package is not a valid ZIP file",
+                apkg_path=str(apkg_path),
+                error=str(e),
+            )
+            raise ValueError(f"Invalid .apkg file (not a valid ZIP): {e}") from e
+
+        except ValueError:
+            # Zip-slip or validation error - already logged, re-raise as-is
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir, ignore_errors=True)
+            raise
+
+        except Exception as e:
+            # Clean up partial extraction
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir, ignore_errors=True)
+
+            logger.error(
+                "Package extraction failed",
+                apkg_path=str(apkg_path),
+                error=str(e),
+                exc_info=True,
+            )
+            raise RuntimeError(f"Failed to extract package: {e}") from e
 
     def get_cached_path(
         self, package_url: str, package_sha256: Optional[str] = None

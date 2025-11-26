@@ -2,14 +2,13 @@
 
 import asyncio
 import os
-import shutil
 import subprocess
 import signal
 import sys
 import time
 import threading
 from pathlib import Path
-from typing import Optional, Dict, IO
+from typing import Optional, Dict, IO, Any
 import structlog
 
 from pixell_runtime.supervisor.models import AgentProcess, AgentStatus, Ports
@@ -35,8 +34,7 @@ class ProcessManager:
         """
         self.graceful_shutdown_timeout_sec = graceful_shutdown_timeout_sec
         self.processes: Dict[str, subprocess.Popen] = {}  # agent_app_id -> Popen
-        self._log_threads: Dict[str, list] = {}  # agent_app_id -> list of threads
-        self._log_file_handles: Dict[str, IO] = {}  # agent_app_id -> open log file handle
+        self.log_files: Dict[str, 'IO[str]'] = {}  # agent_app_id -> log file handle
         logger.info(
             "ProcessManager initialized",
             graceful_shutdown_timeout_sec=graceful_shutdown_timeout_sec,
@@ -66,6 +64,7 @@ class ProcessManager:
         ports: Ports,
         venv_path: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
+        package_env: Optional[Dict[str, str]] = None,
     ) -> int:
         """Spawn an agent process as a specific Linux user.
 
@@ -74,8 +73,8 @@ class ProcessManager:
             linux_user: Linux username to run as
             package_path: Path to extracted agent package directory
             ports: Ports allocation for the agent
-            venv_path: Optional path to virtual environment (if None, uses system Python)
-            env: Additional environment variables
+            env: Additional environment variables from DeployRequest (highest priority)
+            package_env: Environment variables from agent.yaml + deploy.json (medium priority)
 
         Returns:
             Process ID (PID)
@@ -91,87 +90,25 @@ class ProcessManager:
             ports={"rest": ports.rest, "a2a": ports.a2a, "ui": ports.ui},
         )
 
-        # Find pixell_runtime module path for PYTHONPATH
-        # This is needed because pixell_runtime is not installed in agent venvs
-        # Similar to subprocess_runner.py: repo_src_path = Path(__file__).resolve().parents[2]
-        pixell_runtime_path = None
-        try:
-            # Try to find src directory relative to this file
-            # process_manager.py is in src/pixell_runtime/supervisor/
-            # Go up: supervisor -> pixell_runtime -> src
-            current_file = Path(__file__).resolve()
-            src_path = current_file.parent.parent.parent
-            if (src_path / "pixell_runtime").exists():
-                pixell_runtime_path = str(src_path)
-                logger.debug(
-                    "Found pixell_runtime src path",
-                    agent_app_id=agent_app_id,
-                    path=pixell_runtime_path,
-                )
-            else:
-                # Fallback: try importing pixell_runtime to find its location
-                import pixell_runtime
-                runtime_module_path = Path(pixell_runtime.__file__).parent.parent
-                if runtime_module_path.exists():
-                    pixell_runtime_path = str(runtime_module_path)
-                    logger.debug(
-                        "Found pixell_runtime from import",
-                        agent_app_id=agent_app_id,
-                        path=pixell_runtime_path,
-                    )
-        except Exception as e:
-            logger.warning(
-                "Could not find pixell_runtime module path",
-                agent_app_id=agent_app_id,
-                error=str(e),
-            )
+        # Determine home directory for agent user
+        # Format: /home/agent_xxx where xxx matches linux_user suffix
+        home_dir = f"/home/{linux_user}"
 
-        # Build PYTHONPATH: package_path, pixell_runtime_path
-        # Note: When using venv Python, venv's site-packages is automatically prepended to sys.path
-        # We only need to add package_path and pixell_runtime_path, not system site-packages
-        pythonpath_parts = []
-        
-        # Add package path first (highest priority for agent code)
-        if str(package_path) not in pythonpath_parts:
-            pythonpath_parts.append(str(package_path))
-        
-        # Add pixell_runtime path (needed for 'python -m pixell_runtime' command)
-        if pixell_runtime_path and pixell_runtime_path not in pythonpath_parts:
-            pythonpath_parts.append(pixell_runtime_path)
-        
-        # Only add existing PYTHONPATH if it doesn't contain system site-packages
-        # This prevents system packages from overriding venv packages
-        existing_pythonpath = os.getenv("PYTHONPATH", "")
-        if existing_pythonpath:
-            # Filter out system site-packages paths to avoid conflicts
-            system_site_packages = [
-                "/usr/local/lib/python",
-                "/usr/lib/python",
-            ]
-            filtered_paths = []
-            for path in existing_pythonpath.split(":"):
-                if path and not any(sys_path in path for sys_path in system_site_packages):
-                    if path not in pythonpath_parts:
-                        filtered_paths.append(path)
-            
-            if filtered_paths:
-                pythonpath_parts.extend(filtered_paths)
-        
-        pythonpath = ":".join(pythonpath_parts)
-
-        # Build environment variables
+        # Build environment variables - start from supervisor's environment
         process_env = {
+            **os.environ,  # Inherit supervisor's PATH and system environment
+            # Agent-specific variables
             "AGENT_APP_ID": agent_app_id,
             "AGENT_PACKAGE_PATH": str(package_path),
-            # Note: PACKAGE_URL is not set here because AGENT_PACKAGE_PATH is used instead.
-            # PACKAGE_URL is only used in Fargate/ECS mode where packages are downloaded from URLs.
+            # NOTE: PACKAGE_URL not set - runtime will use AGENT_PACKAGE_PATH instead
+            # Runtime validation rejects file:// URLs, and AGENT_PACKAGE_PATH is preferred
             "REST_PORT": str(ports.rest),
             "A2A_PORT": str(ports.a2a),
             "UI_PORT": str(ports.ui),
             "BASE_PATH": f"/agents/{agent_app_id}",
             "MULTIPLEXED": "true",
             "PYTHONUNBUFFERED": "1",  # Ensure logs are not buffered
-            "PYTHONPATH": pythonpath,  # Add PYTHONPATH so pixell_runtime can be imported
+            "HOME": home_dir,  # Set HOME for agent user (UV/pip need this for cache)
         }
         
         # Add virtual environment path if available
@@ -228,128 +165,61 @@ class ProcessManager:
                     error=str(e),
                 )
 
-        # Add custom environment variables
+        # Add environment variables from agent.yaml + deploy.json (medium priority)
+        if package_env:
+            process_env.update(package_env)
+            logger.info(
+                "Added package environment variables",
+                agent_app_id=agent_app_id,
+                package_env_count=len(package_env)
+            )
+
+        # Add custom environment variables from DeployRequest (highest priority)
         if env:
             process_env.update(env)
+            logger.info(
+                "Added deployment environment variables",
+                agent_app_id=agent_app_id,
+                deploy_env_count=len(env)
+            )
 
-        # Find Python executable
-        # Prefer virtual environment Python if available, otherwise use system Python
-        python_exec = None
-        
-        if venv_path:
-            # Use virtual environment Python
-            venv_python_path = Path(venv_path) / "bin" / "python"
-            if venv_python_path.exists():
-                python_exec = str(venv_python_path)
-                logger.info(
-                    "Using virtual environment Python",
-                    agent_app_id=agent_app_id,
-                    venv_path=venv_path,
-                    python_exec=python_exec,
-                )
-            else:
-                logger.warning(
-                    "Virtual environment Python not found, falling back to system Python",
-                    agent_app_id=agent_app_id,
-                    venv_path=venv_path,
-                    expected_path=str(venv_python_path),
-                )
-        
-        # Fallback to system Python if venv not available or not found
-        if not python_exec:
-            # Try common system paths (these work even with minimal PATH)
-            for python_path in ["/usr/bin/python3", "/usr/bin/python", "/usr/local/bin/python3", "/usr/local/bin/python"]:
-                if Path(python_path).exists():
-                    python_exec = python_path
-                    break
-            
-            # If not found in system paths, try to find using current PATH
-            if not python_exec:
-                for python_cmd in ["python3", "python"]:
-                    python_path = shutil.which(python_cmd)
-                    if python_path and Path(python_path).exists():
-                        python_exec = python_path
-                        break
-            
-            # Final fallback
-            if not python_exec:
-                python_exec = "python3"
-                logger.warning(
-                    "Could not find Python executable in system paths, using 'python3' as fallback",
-                    agent_app_id=agent_app_id,
-                    note="This may fail if python3 is not in minimal PATH after 'su -'",
-                )
-            else:
-                logger.debug(
-                    "Using system Python executable",
-                    agent_app_id=agent_app_id,
-                    python_exec=python_exec,
-                )
+        # Fix ownership of extracted package directory if it exists
+        # This prevents permission errors when packages were extracted by a different user
+        self._ensure_package_ownership(agent_app_id, linux_user, package_path)
 
-        # Convert env dict to string for shell (KEY=VALUE prefix)
-        env_string = " ".join([f"{k}={v}" for k, v in process_env.items() if v is not None])
-        if env_string:
-            env_string = f"{env_string} "
-
-        # Command to run as different user
-        # su - <user> -s /bin/bash -c "export ENV_VARS && <python_exec> -m pixell_runtime"
-        # Note: Using full path or python3 ensures it's found even with minimal PATH
-        shell_command = f"exec {env_string}{python_exec} -m pixell_runtime".strip()
-
+        # Command to run - direct Python invocation (no shell, no su)
         cmd = [
-            "su",
-            "-",
-            linux_user,
-            "-s",
-            "/bin/bash",
-            "-c",
-            shell_command,
+            "/usr/bin/python3.11",
+            "-m",
+            "pixell_runtime",
         ]
 
         try:
-            # Determine stdout/stderr redirection
-            # Redirect both stdout and stderr to log file to capture all output
-            # This ensures we get logs even if process crashes before logging initializes
-            stdout_target = subprocess.PIPE
-            stderr_target = subprocess.PIPE
-            log_file_handle: Optional[IO] = None
-            
-            if log_file_path:
-                try:
-                    # Open log file in append mode with line buffering and redirect both streams directly
-                    log_file_handle = open(log_file_path, "a", buffering=1)
-                    stdout_target = log_file_handle
-                    stderr_target = log_file_handle
-                    logger.debug(
-                        "Redirecting stdout/stderr to log file",
-                        agent_app_id=agent_app_id,
-                        log_file=str(log_file_path),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Could not open log file for stream redirection, using PIPE",
-                        agent_app_id=agent_app_id,
-                        log_file=str(log_file_path),
-                        error=str(e),
-                    )
-                    stderr_target = subprocess.PIPE
-            
-            # Spawn process
-            def _preexec():
-                try:
-                    os.setsid()
-                except Exception:
-                    pass
-                try:
-                    signal.signal(signal.SIGINT, signal.SIG_IGN)
-                except Exception:
-                    pass
+            # Create log directory and file for agent output
+            log_dir = Path("/var/lib/pixell/logs")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / f"agent_{agent_app_id}.log"
 
+            # Open log file with line buffering for real-time output
+            log_handle = open(log_file, "w", buffering=1)
+            self.log_files[agent_app_id] = log_handle
+
+            logger.info(
+                "Created log file for agent",
+                agent_app_id=agent_app_id,
+                log_file=str(log_file),
+            )
+
+            # Spawn process as target user using native Python API (Python 3.9+)
+            # This is the production-standard way to spawn processes as different users.
+            # Much more reliable than using 'su' - no shell involved, env vars work correctly.
             process = subprocess.Popen(
                 cmd,
-                stdout=stdout_target,
-                stderr=stderr_target,
-                preexec_fn=_preexec,
+                user=linux_user,  # Python 3.9+ native user switching
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,  # Merge stderr into stdout for unified log
+                env=process_env,
+                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
             )
 
             if log_file_handle:
@@ -389,20 +259,271 @@ class ProcessManager:
             )
             raise RuntimeError(f"Failed to spawn agent {agent_app_id}: {e}") from e
 
-    def is_running(self, agent_app_id: str) -> bool:
-        """Check if agent process is running.
+    def _ensure_package_ownership(
+        self, agent_app_id: str, linux_user: str, package_path: Path
+    ) -> None:
+        """Ensure extracted package directory is owned by the agent user.
+
+        This fixes permission issues when packages are extracted by different users
+        (e.g., supervisor as root, or previously by another agent user).
+
+        Args:
+            agent_app_id: Agent identifier
+            linux_user: Linux username to set as owner
+            package_path: Path to the .apkg file
+
+        Note:
+            This is a best-effort operation. Failures are logged but don't prevent
+            agent startup, as the agent will attempt extraction anyway.
+        """
+        import zipfile
+        import yaml
+
+        try:
+            # Read manifest from .apkg to get package_id
+            with zipfile.ZipFile(package_path, 'r') as zf:
+                if 'agent.yaml' not in zf.namelist():
+                    logger.debug(
+                        "Cannot determine package_id - agent.yaml not in .apkg",
+                        agent_app_id=agent_app_id
+                    )
+                    return
+
+                with zf.open('agent.yaml') as f:
+                    manifest = yaml.safe_load(f)
+                    package_id = f"{manifest['name']}@{manifest['version']}"
+                    # Use same shared extraction directory as supervisor
+                    packages_extract_dir = Path("/tmp/pixell_packages")
+                    extracted_dir = packages_extract_dir / package_id
+
+                    # If directory exists, fix ownership
+                    if extracted_dir.exists():
+                        logger.info(
+                            "Fixing ownership of existing extracted package",
+                            agent_app_id=agent_app_id,
+                            path=str(extracted_dir),
+                            owner=linux_user
+                        )
+
+                        result = subprocess.run(
+                            ["chown", "-R", f"{linux_user}:{linux_user}", str(extracted_dir)],
+                            capture_output=True,
+                            text=True,
+                            check=False,  # Don't fail if this doesn't work
+                            timeout=10
+                        )
+
+                        if result.returncode == 0:
+                            logger.info(
+                                "Successfully fixed package directory ownership",
+                                agent_app_id=agent_app_id,
+                                path=str(extracted_dir)
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to fix package directory ownership",
+                                agent_app_id=agent_app_id,
+                                path=str(extracted_dir),
+                                error=result.stderr,
+                                note="Agent will attempt extraction anyway"
+                            )
+
+        except zipfile.BadZipFile:
+            logger.debug(
+                "Package file is not a valid zip",
+                agent_app_id=agent_app_id,
+                path=str(package_path)
+            )
+        except Exception as e:
+            logger.debug(
+                "Could not pre-fix package directory ownership",
+                agent_app_id=agent_app_id,
+                error=str(e),
+                note="Agent will attempt extraction anyway"
+            )
+
+    def is_process_zombie(self, pid: Optional[int]) -> bool:
+        """Check if a process is a zombie.
+
+        A zombie process is a terminated process that hasn't been reaped by its parent.
+        Zombies remain in the process table with state 'Z' until reaped via wait()/waitpid().
+
+        Args:
+            pid: Process ID to check
+
+        Returns:
+            True if process is a zombie, False otherwise (including if process doesn't exist)
+
+        Notes:
+            - Uses psutil for cross-platform compatibility (Linux, macOS)
+            - Returns False if process doesn't exist or psutil unavailable
+            - Zombies have status psutil.STATUS_ZOMBIE or 'zombie' string
+        """
+        if pid is None:
+            return False
+
+        try:
+            import psutil
+
+            process = psutil.Process(pid)
+            status = process.status()
+
+            # Cross-platform zombie detection
+            # psutil.STATUS_ZOMBIE is a constant on all platforms
+            is_zombie = (
+                status == psutil.STATUS_ZOMBIE
+                or status == "zombie"
+                or status == "Z"
+            )
+
+            if is_zombie:
+                logger.debug(
+                    "Detected zombie process",
+                    pid=pid,
+                    status=status,
+                )
+
+            return is_zombie
+
+        except ImportError:
+            logger.warning(
+                "psutil not available - cannot detect zombie processes",
+                pid=pid,
+            )
+            return False
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # Process doesn't exist or we can't access it
+            logger.debug("Process not found or access denied", pid=pid)
+            return False
+        except Exception as e:
+            logger.warning(
+                "Error checking if process is zombie",
+                pid=pid,
+                error=str(e),
+            )
+            return False
+
+    def get_process_health(self, agent_app_id: str) -> Dict[str, Any]:
+        """Get comprehensive process health information.
+
+        This method performs real-time checks to determine if a process is:
+        - Alive and running
+        - A zombie (crashed but not reaped)
+        - Stopped/terminated
 
         Args:
             agent_app_id: Agent identifier
 
         Returns:
-            True if process is running, False otherwise
+            Dictionary with:
+            - is_alive: bool - Process is running and not a zombie
+            - is_zombie: bool - Process is a zombie
+            - memory_mb: float - Memory usage in MB (0.0 if zombie/stopped)
+            - cpu_percent: float - CPU usage percent (0.0 if zombie/stopped)
+            - pid: Optional[int] - Process ID
+
+        Notes:
+            - This is the authoritative health check for status endpoints
+            - Zombies return is_alive=False, is_zombie=True, metrics=0
+            - Gracefully handles psutil unavailable or process not found
+        """
+        if agent_app_id not in self.processes:
+            return {
+                "is_alive": False,
+                "is_zombie": False,
+                "memory_mb": 0.0,
+                "cpu_percent": 0.0,
+                "pid": None,
+            }
+
+        process = self.processes[agent_app_id]
+        pid = process.pid
+
+        # Check if process has terminated
+        if process.poll() is not None:
+            return {
+                "is_alive": False,
+                "is_zombie": False,
+                "memory_mb": 0.0,
+                "cpu_percent": 0.0,
+                "pid": pid,
+            }
+
+        # Check if process is a zombie
+        is_zombie = self.is_process_zombie(pid)
+
+        if is_zombie:
+            return {
+                "is_alive": False,
+                "is_zombie": True,
+                "memory_mb": 0.0,
+                "cpu_percent": 0.0,
+                "pid": pid,
+            }
+
+        # Process is alive - get metrics
+        memory_mb = 0.0
+        cpu_percent = 0.0
+
+        try:
+            import psutil
+
+            ps_process = psutil.Process(pid)
+            memory_mb = ps_process.memory_info().rss / (1024 * 1024)  # bytes to MB
+            cpu_percent = ps_process.cpu_percent(interval=0.1)
+
+        except ImportError:
+            logger.debug("psutil not available for metrics", agent_app_id=agent_app_id)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            logger.debug(
+                "Cannot get process metrics",
+                agent_app_id=agent_app_id,
+                pid=pid,
+            )
+        except Exception as e:
+            logger.warning(
+                "Error getting process metrics",
+                agent_app_id=agent_app_id,
+                pid=pid,
+                error=str(e),
+            )
+
+        return {
+            "is_alive": True,
+            "is_zombie": False,
+            "memory_mb": memory_mb,
+            "cpu_percent": cpu_percent,
+            "pid": pid,
+        }
+
+    def is_running(self, agent_app_id: str) -> bool:
+        """Check if agent process is running AND not a zombie.
+
+        Args:
+            agent_app_id: Agent identifier
+
+        Returns:
+            True if process is running and alive (not zombie), False otherwise
+
+        Notes:
+            - Zombies are NOT considered running (they're dead but not reaped)
+            - This method now uses real-time zombie detection
+            - Changed from old behavior which considered zombies as "running"
         """
         if agent_app_id not in self.processes:
             return False
 
         process = self.processes[agent_app_id]
-        return process.poll() is None
+
+        # Check if process has terminated
+        if process.poll() is not None:
+            return False
+
+        # Check if process is a zombie (terminated but not reaped)
+        if self.is_process_zombie(process.pid):
+            return False
+
+        return True
 
     def get_pid(self, agent_app_id: str) -> Optional[int]:
         """Get process ID for an agent.
@@ -444,6 +565,13 @@ class ProcessManager:
         # Check if already stopped
         if process.poll() is not None:
             logger.info("Agent process already stopped", agent_app_id=agent_app_id, pid=pid)
+            # Close log file if open
+            if agent_app_id in self.log_files:
+                try:
+                    self.log_files[agent_app_id].close()
+                except Exception:
+                    pass
+                del self.log_files[agent_app_id]
             del self.processes[agent_app_id]
             return True
 
@@ -495,6 +623,13 @@ class ProcessManager:
                 del self._log_file_handles[agent_app_id]
             
             # Clean up
+            # Close log file if open
+            if agent_app_id in self.log_files:
+                try:
+                    self.log_files[agent_app_id].close()
+                except Exception:
+                    pass
+                del self.log_files[agent_app_id]
             del self.processes[agent_app_id]
             return True
 
@@ -705,12 +840,10 @@ class ProcessManager:
         """Clean up process manager resources."""
         logger.info("Cleaning up ProcessManager")
         self.stop_all(force=True)
-        # Clean up log threads
-        self._log_threads.clear()
-        # Close any remaining log file handles
-        for agent_app_id, log_handle in list(self._log_file_handles.items()):
+        # Close any remaining log files
+        for agent_id, log_handle in list(self.log_files.items()):
             try:
                 log_handle.close()
             except Exception:
                 pass
-        self._log_file_handles.clear()
+        self.log_files.clear()

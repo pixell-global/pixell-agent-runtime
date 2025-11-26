@@ -6,26 +6,27 @@ from pixell_runtime.supervisor.models import Ports
 
 
 def test_port_allocator_init():
-    """Test PortAllocator initialization."""
+    """Test PortAllocator initialization (NEW: 200-agent capacity)."""
     allocator = PortAllocator()
-    assert allocator.max_agents() == 20
-    assert allocator.available_slots() == 20
+    assert allocator.max_agents() == 200  # Updated from 20 to 200
+    assert allocator.available_slots() == 200
     assert len(allocator.allocations) == 0
 
 
 def test_allocate_first_agent():
-    """Test allocating ports for first agent."""
+    """Test allocating ports for first agent (NEW: PAC port ranges)."""
     allocator = PortAllocator()
     ports = allocator.allocate("4906eeb7")
 
-    assert ports.rest == 8081
-    assert ports.a2a == 50052
-    assert ports.ui == 3001
-    assert allocator.available_slots() == 19
+    # New PAC port ranges
+    assert ports.rest == 63000  # Updated from 8081
+    assert ports.a2a == 60000   # Updated from 50052
+    assert ports.ui == 65000    # Updated from 3001
+    assert allocator.available_slots() == 199  # Updated from 19
 
 
 def test_allocate_multiple_agents():
-    """Test allocating ports for multiple agents."""
+    """Test allocating ports for multiple agents (NEW: PAC port ranges)."""
     allocator = PortAllocator()
 
     # Allocate for 3 agents
@@ -33,20 +34,20 @@ def test_allocate_multiple_agents():
     ports2 = allocator.allocate("agent2")
     ports3 = allocator.allocate("agent3")
 
-    # Each should get unique ports
-    assert ports1.rest == 8081
-    assert ports2.rest == 8082
-    assert ports3.rest == 8083
+    # Each should get unique ports in new ranges
+    assert ports1.rest == 63000  # Updated from 8081
+    assert ports2.rest == 63001  # Updated from 8082
+    assert ports3.rest == 63002  # Updated from 8083
 
-    assert ports1.a2a == 50052
-    assert ports2.a2a == 50053
-    assert ports3.a2a == 50054
+    assert ports1.a2a == 60000  # Updated from 50052
+    assert ports2.a2a == 60001  # Updated from 50053
+    assert ports3.a2a == 60002  # Updated from 50054
 
-    assert ports1.ui == 3001
-    assert ports2.ui == 3002
-    assert ports3.ui == 3003
+    assert ports1.ui == 65000  # Updated from 3001
+    assert ports2.ui == 65001  # Updated from 3002
+    assert ports3.ui == 65002  # Updated from 3003
 
-    assert allocator.available_slots() == 17
+    assert allocator.available_slots() == 197  # Updated from 17
 
 
 def test_allocate_reuse_existing():
@@ -55,12 +56,12 @@ def test_allocate_reuse_existing():
 
     # Allocate for agent
     ports1 = allocator.allocate("4906eeb7")
-    assert ports1.rest == 8081
+    assert ports1.rest == 63000
 
     # Allocate again with reuse=True (default)
     ports2 = allocator.allocate("4906eeb7", reuse=True)
-    assert ports2.rest == 8081  # Same ports
-    assert allocator.available_slots() == 19  # Still only 1 agent
+    assert ports2.rest == 63000  # Same ports
+    assert allocator.available_slots() == 199  # Still only 1 agent
 
 
 def test_allocate_replace_existing():
@@ -69,15 +70,15 @@ def test_allocate_replace_existing():
 
     # Allocate for agent
     ports1 = allocator.allocate("4906eeb7")
-    assert ports1.rest == 8081
+    assert ports1.rest == 63000
 
     # Allocate second agent to consume next port
     allocator.allocate("other_agent")
 
     # Replace allocation for first agent with reuse=False
     ports2 = allocator.allocate("4906eeb7", reuse=False)
-    # Port 8081 was released, so it's available again and will be reused
-    assert ports2.rest == 8081  # First available port after release
+    # Port 63000 was released, so it's available again and will be reused
+    assert ports2.rest == 63000  # First available port after release
 
 
 def test_release_ports():
@@ -86,11 +87,11 @@ def test_release_ports():
 
     # Allocate and release
     allocator.allocate("4906eeb7")
-    assert allocator.available_slots() == 19
+    assert allocator.available_slots() == 199
 
     released = allocator.release("4906eeb7")
     assert released is True
-    assert allocator.available_slots() == 20
+    assert allocator.available_slots() == 200
 
 
 def test_release_nonexistent():
@@ -172,10 +173,10 @@ def test_port_ranges():
     for i in range(10):
         ports = allocator.allocate(f"agent_{i}")
 
-        # Verify ports are in range
-        assert 8081 <= ports.rest <= 8100
-        assert 50052 <= ports.a2a <= 50071
-        assert 3001 <= ports.ui <= 3020
+        # Verify ports are in range (NEW: PAC port ranges)
+        assert 63000 <= ports.rest <= 63199
+        assert 60000 <= ports.a2a <= 60199
+        assert 65000 <= ports.ui <= 65199
 
 
 def test_allocation_uniqueness():

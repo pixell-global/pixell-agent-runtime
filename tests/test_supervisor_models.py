@@ -35,27 +35,22 @@ def test_ports_valid():
 
 
 def test_ports_invalid_range():
-    """Test Ports validation rejects out-of-range values."""
-    # REST port out of range
-    with pytest.raises(ValueError):
-        Ports(rest=8000, a2a=50052, ui=3001)
+    """Test Ports validation rejects invalid values (NEW: PAC scheme)."""
+    from pydantic import ValidationError
 
-    with pytest.raises(ValueError):
-        Ports(rest=8101, a2a=50052, ui=3001)
+    # Ports must be >= 1024 (privileged ports are rejected)
+    with pytest.raises(ValidationError):
+        Ports(rest=80, a2a=60000, ui=65000)
 
-    # A2A port out of range
-    with pytest.raises(ValueError):
-        Ports(rest=8081, a2a=50000, ui=3001)
+    with pytest.raises(ValidationError):
+        Ports(rest=63000, a2a=22, ui=65000)
 
-    with pytest.raises(ValueError):
-        Ports(rest=8081, a2a=50100, ui=3001)
+    with pytest.raises(ValidationError):
+        Ports(rest=63000, a2a=60000, ui=443)
 
-    # UI port out of range
-    with pytest.raises(ValueError):
-        Ports(rest=8081, a2a=50052, ui=3000)
-
-    with pytest.raises(ValueError):
-        Ports(rest=8081, a2a=50052, ui=3021)
+    # Ports below 1024 should be rejected
+    with pytest.raises(ValidationError):
+        Ports(rest=1023, a2a=60000, ui=65000)
 
 
 def test_deploy_request_minimal():
@@ -74,7 +69,7 @@ def test_deploy_request_minimal():
     assert req.org_id == "org-123"
     assert req.package_sha256 is None
     assert req.max_package_size_mb == 100
-    assert req.boot_budget_ms == 5000
+    assert req.boot_budget_ms == 120000  # Default is 120000ms (2 minutes)
     assert req.boot_hard_limit_multiplier == 2.0
     assert req.graceful_shutdown_timeout_sec == 30
     assert req.env == {}
@@ -122,11 +117,11 @@ def test_delete_request():
     req = DeleteRequest(agent_app_id="4906eeb7")
     assert req.agent_app_id == "4906eeb7"
     assert req.force is False
-    assert req.cleanup_user is True
+    assert req.cleanup_user is False  # Default is now False (preserve user for reuse)
 
-    req2 = DeleteRequest(agent_app_id="4906eeb7", force=True, cleanup_user=False)
+    req2 = DeleteRequest(agent_app_id="4906eeb7", force=True, cleanup_user=True)
     assert req2.force is True
-    assert req2.cleanup_user is False
+    assert req2.cleanup_user is True  # Explicitly request user cleanup
 
 
 def test_agent_process():
