@@ -102,7 +102,9 @@ class SupervisorState:
         """
         import subprocess
 
-        packages_extract_dir = Path("/tmp/pixell_packages")
+        # Use environment variable for package extract dir, default to /tmp/pixell_packages
+        # This allows configuration in diverse environments (EC2, Docker, Local)
+        packages_extract_dir = Path(os.getenv("PACKAGES_EXTRACT_DIR", "/tmp/pixell_packages"))
 
         try:
             # Create directory if it doesn't exist
@@ -110,28 +112,35 @@ class SupervisorState:
 
             # Set permissions to 1777 (drwxrwxrwt) - world-writable with sticky bit
             # Sticky bit ensures users can only delete their own directories
-            subprocess.run(
-                ["chmod", "1777", str(packages_extract_dir)],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=5
-            )
+            try:
+                subprocess.run(
+                    ["chmod", "1777", str(packages_extract_dir)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=5
+                )
+                logger.info(
+                    "Initialized shared package extraction directory",
+                    path=str(packages_extract_dir),
+                    permissions="1777 (drwxrwxrwt)",
+                    note="All agent users can create subdirectories for package extraction"
+                )
+            except FileNotFoundError:
+                # chmod might not be available on Windows or restricted environments
+                logger.warning(
+                    "chmod command not found, skipping permission setting",
+                    path=str(packages_extract_dir),
+                    note="Ensure directory has correct permissions manually if needed"
+                )
+            except subprocess.CalledProcessError as e:
+                logger.warning(
+                    "Failed to set permissions on package extraction directory (chmod failed)",
+                    path=str(packages_extract_dir),
+                    error=e.stderr,
+                    note="Agents may fail to extract packages if permissions are too restrictive"
+                )
 
-            logger.info(
-                "Initialized shared package extraction directory",
-                path=str(packages_extract_dir),
-                permissions="1777 (drwxrwxrwt)",
-                note="All agent users can create subdirectories for package extraction"
-            )
-
-        except subprocess.CalledProcessError as e:
-            logger.error(
-                "Failed to set permissions on package extraction directory",
-                path=str(packages_extract_dir),
-                error=e.stderr,
-                note="Agents may fail to extract packages"
-            )
         except Exception as e:
             logger.error(
                 "Failed to initialize package extraction directory",
@@ -824,6 +833,47 @@ class SupervisorState:
 
             raise
 
+    def _force_remove_dir(self, path: Path) -> None:
+        """Recursively remove a directory, handling permission errors.
+
+        On Linux/Unix, this attempts to change ownership/permissions before deletion
+        if the standard rmtree fails.
+
+        Args:
+            path: Directory to remove
+        """
+        if not path.exists():
+            return
+
+        try:
+            shutil.rmtree(path)
+        except PermissionError:
+            # Permission denied - try to fix permissions and retry
+            logger.warning(
+                "Permission denied removing directory, attempting to fix permissions",
+                path=str(path)
+            )
+            try:
+                # Try to make everything writable and owned by current user
+                subprocess.run(
+                    ["chmod", "-R", "777", str(path)],
+                    capture_output=True,
+                    check=False
+                )
+                # Retry deletion
+                shutil.rmtree(path)
+                logger.info("Successfully removed directory after permission fix", path=str(path))
+            except Exception as e:
+                logger.error(
+                    "Failed to remove directory even after permission fix attempt",
+                    path=str(path),
+                    error=str(e)
+                )
+                raise
+        except Exception as e:
+            logger.error("Failed to remove directory", path=str(path), error=str(e))
+            raise
+
     async def update(self, request: UpdateRequest) -> AgentProcess:
         """Update an existing agent (zero-downtime).
 
@@ -952,7 +1002,7 @@ class SupervisorState:
                         old_venv=str(old_venv),
                     )
                     try:
-                        shutil.rmtree(old_venv)
+                        self._force_remove_dir(old_venv)
                     except Exception as e:
                         logger.warning(
                             "Failed to remove old venv, continuing",
@@ -973,7 +1023,7 @@ class SupervisorState:
                                 old_venv=str(venv_item),
                             )
                             try:
-                                shutil.rmtree(venv_item)
+                                self._force_remove_dir(venv_item)
                             except Exception as e:
                                 logger.warning(
                                     "Failed to remove old venv, continuing",

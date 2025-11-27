@@ -240,8 +240,23 @@ class ThreeSurfaceRuntime:
         logger.info("Loading agent package", path=self.package_path)
 
         # Create package loader
+        # Use environment variables from Supervisor to locate packages/venvs correctly
         packages_dir = Path("/tmp/pixell_packages")
-        loader = PackageLoader(packages_dir)
+        venvs_dir = None
+        
+        # If package path is known (from AGENT_PACKAGE_PATH or download), use its parent as packages_dir
+        if self.package_path:
+            packages_dir = Path(self.package_path).parent
+            
+        # If AGENT_VENV_PATH is provided by Supervisor, use its parent as venvs_dir
+        # This ensures we use the Supervisor-created venvs in the user's home directory
+        # instead of trying to create new ones in /tmp/venvs (which causes Permission denied)
+        agent_venv_path = os.getenv("AGENT_VENV_PATH")
+        if agent_venv_path:
+            venvs_dir = Path(agent_venv_path).parent
+            logger.info("Using venvs directory from environment", venvs_dir=str(venvs_dir))
+
+        loader = PackageLoader(packages_dir, venvs_dir=venvs_dir)
 
         # Load package
         self.package = loader.load_package(Path(self.package_path))
