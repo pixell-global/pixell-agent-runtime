@@ -993,6 +993,7 @@ class SupervisorState:
             # Clean up old virtual environments for this agent_app_id
             # This ensures requirements changes trigger fresh venv creation
             old_venv_path = agent_process.venv_path
+            old_venv = None
             if old_venv_path:
                 old_venv = Path(old_venv_path)
                 if old_venv.exists() and old_venv.parent == venvs_dir:
@@ -1016,7 +1017,7 @@ class SupervisorState:
             if venvs_dir.exists():
                 for venv_item in venvs_dir.iterdir():
                     if venv_item.is_dir() and venv_item.name.startswith(f"{agent_app_id}_"):
-                        if venv_item != old_venv:  # Don't delete twice
+                        if old_venv is None or venv_item != old_venv:  # Don't delete twice
                             logger.info(
                                 "Removing old virtual environment",
                                 agent_app_id=agent_app_id,

@@ -744,13 +744,33 @@ class PackageLoader:
                     )
 
                     if result.returncode != 0:
-                        logger.error("Agent package installation failed",
-                                    venv=venv_name,
-                                    stderr=result.stderr,
-                                    stdout=result.stdout)
-                        raise PackageLoadError(f"Agent package installation failed: {result.stderr}")
-
-                    logger.info("Agent package installed successfully", venv=venv_name)
+                        logger.warning("Editable install failed, trying regular install",
+                                     venv=venv_name,
+                                     error=result.stderr)
+                        
+                        # Fallback to regular install
+                        try:
+                            result = subprocess.run(
+                                [str(pip_path), "install", str(package_path)],
+                                capture_output=True,
+                                text=True,
+                                timeout=120
+                            )
+                            
+                            if result.returncode != 0:
+                                logger.error("Agent package regular installation failed",
+                                            venv=venv_name,
+                                            stderr=result.stderr,
+                                            stdout=result.stdout)
+                                raise PackageLoadError(f"Agent package installation failed: {result.stderr}")
+                                
+                            logger.info("Agent package installed successfully (regular mode)", venv=venv_name)
+                            
+                        except subprocess.TimeoutExpired:
+                            logger.error("Agent package regular installation timed out", venv=venv_name)
+                            raise PackageLoadError("Agent package installation timed out after 120s")
+                    else:
+                        logger.info("Agent package installed successfully", venv=venv_name)
 
                 except subprocess.TimeoutExpired:
                     logger.error("Agent package installation timed out", venv=venv_name)
