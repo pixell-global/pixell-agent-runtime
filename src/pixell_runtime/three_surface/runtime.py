@@ -80,6 +80,17 @@ class ThreeSurfaceRuntime:
         # Store validated configuration
         self.agent_app_id = config.agent_app_id
         self.deployment_id = config.deployment_id
+        # IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+        # DEPRECATED: socket_mode=False (TCP ports) is deprecated and should NEVER be activated.
+        # Port mode has hard capacity limits (200 agents max) and is being phased out.
+        self.socket_mode = config.socket_mode
+        # Socket paths (used when socket_mode=True) - THIS IS THE PREFERRED MODE
+        self.rest_socket = config.rest_socket
+        self.a2a_socket = config.a2a_socket
+        self.ui_socket = config.ui_socket
+        # DEPRECATED: Ports (used when socket_mode=False) - DO NOT USE
+        # Port mode is deprecated and should never be activated in production.
+        # These fields exist only for backwards compatibility during migration.
         self.rest_port = config.rest_port
         self.a2a_port = config.a2a_port
         self.ui_port = config.ui_port
@@ -276,7 +287,10 @@ class ThreeSurfaceRuntime:
         if not self.package:
             raise RuntimeError("Package must be loaded before starting servers")
 
-        logger.info("Starting REST server", port=self.rest_port)
+        if self.socket_mode:
+            logger.info("Starting REST server (socket mode)", socket=self.rest_socket)
+        else:
+            logger.info("Starting REST server (port mode)", port=self.rest_port)
 
         # Refresh base path from env at start time if explicitly provided
         import os as _os
@@ -290,27 +304,48 @@ class ThreeSurfaceRuntime:
         self.rest_app = create_rest_app(self.package, base_path=self.base_path)
 
         # Setup UI routes if multiplexed
-        logger.info("Checking UI setup", 
+        logger.info("Checking UI setup",
                    multiplexed=self.multiplexed,
                    has_ui_config=bool(self.package.manifest.ui),
                    package_id=self.package.id)
-        
+
         if self.multiplexed and self.package.manifest.ui:
             logger.info("Setting up UI routes for multiplexed mode", package_id=self.package.id)
             setup_ui_routes(self.rest_app, self.package)
         else:
-            logger.info("Skipping UI setup", 
+            logger.info("Skipping UI setup",
                        multiplexed=self.multiplexed,
                        has_ui_config=bool(self.package.manifest.ui))
 
-        # Start server
-        config = uvicorn.Config(
-            self.rest_app,
-            host="0.0.0.0",
-            port=self.rest_port,
-            log_config=None,  # We handle logging ourselves
-            access_log=False,
-        )
+        # Start server with socket or port binding
+        # IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+        # DEPRECATED: socket_mode=False (port binding) is deprecated and should NEVER be activated.
+        if self.socket_mode:
+            # PREFERRED: Unix domain socket mode
+            # Remove stale socket file if it exists
+            from pathlib import Path
+            socket_path = Path(self.rest_socket)
+            if socket_path.exists():
+                logger.info("Removing stale REST socket", socket=self.rest_socket)
+                socket_path.unlink()
+
+            config = uvicorn.Config(
+                self.rest_app,
+                uds=self.rest_socket,  # Unix domain socket
+                log_config=None,  # We handle logging ourselves
+                access_log=False,
+            )
+        else:
+            # DEPRECATED: Port binding mode - DO NOT USE
+            # This branch exists only for backwards compatibility.
+            # TODO: Remove port binding support once all agents use socket mode.
+            config = uvicorn.Config(
+                self.rest_app,
+                host="0.0.0.0",
+                port=self.rest_port,
+                log_config=None,  # We handle logging ourselves
+                access_log=False,
+            )
 
         server = uvicorn.Server(config)
         self._rest_server = server
@@ -325,7 +360,10 @@ class ThreeSurfaceRuntime:
             logger.info("No HTTP A2A configuration found, skipping HTTP A2A server")
             return
 
-        logger.info("Starting A2A HTTP server", port=self.a2a_port, entry=self.package.manifest.a2a.http_server)
+        if self.socket_mode:
+            logger.info("Starting A2A HTTP server (socket mode)", socket=self.a2a_socket, entry=self.package.manifest.a2a.http_server)
+        else:
+            logger.info("Starting A2A HTTP server (port mode)", port=self.a2a_port, entry=self.package.manifest.a2a.http_server)
         if hasattr(self, "_boot_metrics"):
             self._boot_metrics.start_phase("a2a_http")
 
@@ -663,24 +701,76 @@ class ThreeSurfaceRuntime:
             if hasattr(app, 'build'):
                 app = app.build()
 
-            # Start uvicorn server
-            config = uvicorn.Config(
-                app,
-                host="0.0.0.0",
-                port=self.a2a_port,
-                log_config=None,
-                access_log=False,
-            )
-            self._http_a2a_server = uvicorn.Server(config)
-            logger.info("A2A HTTP server created", port=self.a2a_port)
+            # Handle handlers dict pattern (same as gRPC A2A server)
+            # When agent's create_service() returns {"custom_handlers": {...}},
+            # wrap it in an ASGI-compatible A2A HTTP app
+            # Optional: "streaming_handlers" for SSE streaming support
+            if isinstance(app, dict) and 'custom_handlers' in app:
+                from pixell_runtime.a2a.http_wrapper import create_a2a_http_app
+                handlers = app['custom_handlers']
+                streaming_handlers = app.get('streaming_handlers')  # Optional streaming handlers
+                agent_name = self.package.manifest.name if self.package else "Agent"
+                agent_version = self.package.manifest.version if self.package else "1.0.0"
+                agent_description = self.package.manifest.description if self.package else None
+                logger.info(
+                    "Wrapping handlers dict in A2A HTTP app",
+                    handler_count=len(handlers),
+                    handlers=list(handlers.keys()),
+                    streaming_handlers=list(streaming_handlers.keys()) if streaming_handlers else [],
+                    agent_name=agent_name
+                )
+                app = create_a2a_http_app(
+                    handlers,
+                    agent_name=agent_name,
+                    agent_version=agent_version,
+                    agent_description=agent_description,
+                    streaming_handlers=streaming_handlers
+                )
+
+            # Start uvicorn server with socket or port binding
+            # IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+            # DEPRECATED: socket_mode=False (port binding) is deprecated and should NEVER be activated.
+            if self.socket_mode:
+                # PREFERRED: Unix domain socket mode
+                # Remove stale socket file if it exists
+                from pathlib import Path
+                socket_path = Path(self.a2a_socket)
+                if socket_path.exists():
+                    logger.info("Removing stale A2A socket", socket=self.a2a_socket)
+                    socket_path.unlink()
+
+                config = uvicorn.Config(
+                    app,
+                    uds=self.a2a_socket,  # Unix domain socket
+                    log_config=None,
+                    access_log=False,
+                )
+                self._http_a2a_server = uvicorn.Server(config)
+                logger.info("A2A HTTP server created (socket mode)", socket=self.a2a_socket)
+            else:
+                # DEPRECATED: Port binding mode - DO NOT USE
+                # This branch exists only for backwards compatibility.
+                # TODO: Remove port binding support once all agents use socket mode.
+                config = uvicorn.Config(
+                    app,
+                    host="0.0.0.0",
+                    port=self.a2a_port,
+                    log_config=None,
+                    access_log=False,
+                )
+                self._http_a2a_server = uvicorn.Server(config)
+                logger.info("A2A HTTP server created (port mode - DEPRECATED)", port=self.a2a_port)
             
             # Start server in background
             asyncio.create_task(self._http_a2a_server.serve())
-            
+
             if hasattr(self, "_boot_metrics"):
                 self._boot_metrics.end_phase("a2a_http")
-                
-            logger.info("A2A HTTP server started", port=self.a2a_port)
+
+            if self.socket_mode:
+                logger.info("A2A HTTP server started (socket mode)", socket=self.a2a_socket)
+            else:
+                logger.info("A2A HTTP server started (port mode)", port=self.a2a_port)
             
         except Exception as e:
             logger.error("Failed to start A2A HTTP server", error=str(e), exc_info=True)
@@ -701,12 +791,20 @@ class ThreeSurfaceRuntime:
             logger.info("HTTP A2A server configured, skipping gRPC server")
             return
 
-        logger.info("Starting A2A gRPC server", port=self.a2a_port)
+        if self.socket_mode:
+            logger.info("Starting A2A gRPC server (socket mode)", socket=self.a2a_socket)
+        else:
+            logger.info("Starting A2A gRPC server (port mode)", port=self.a2a_port)
         if hasattr(self, "_boot_metrics"):
             self._boot_metrics.start_phase("a2a")
 
-        # Create gRPC server
-        self.grpc_server = create_grpc_server(self.package, self.a2a_port)
+        # Create gRPC server with socket or port binding
+        self.grpc_server = create_grpc_server(
+            self.package,
+            port=self.a2a_port,
+            socket_path=self.a2a_socket if self.socket_mode else None,
+            agent_id=self.agent_app_id,
+        )
 
         # Start server
         await start_grpc_server(self.grpc_server)
@@ -717,7 +815,11 @@ class ThreeSurfaceRuntime:
             ok = False
             while asyncio.get_event_loop().time() < deadline:
                 try:
-                    async with grpc.aio.insecure_channel(f"localhost:{self.a2a_port}") as channel:
+                    if self.socket_mode:
+                        channel = grpc.aio.insecure_channel(f"unix:{self.a2a_socket}")
+                    else:
+                        channel = grpc.aio.insecure_channel(f"localhost:{self.a2a_port}")
+                    async with channel:
                         stub = agent_pb2_grpc.AgentServiceStub(channel)
                         await stub.Health(agent_pb2.Empty(), timeout=0.3)
                         ok = True
@@ -749,7 +851,10 @@ class ThreeSurfaceRuntime:
                         except Exception:
                             pass
 
-                    logger.info("Runtime ready", rest_port=self.rest_port, a2a_port=self.a2a_port, boot_ms=round(boot_ms, 3))
+                    if self.socket_mode:
+                        logger.info("Runtime ready (socket mode)", rest_socket=self.rest_socket, a2a_socket=self.a2a_socket, boot_ms=round(boot_ms, 3))
+                    else:
+                        logger.info("Runtime ready (port mode)", rest_port=self.rest_port, a2a_port=self.a2a_port, boot_ms=round(boot_ms, 3))
                     budget_ms = float(self.boot_budget_ms)
                     if boot_ms > budget_ms:
                         logger.warning("Boot time exceeded budget", boot_ms=boot_ms, budget_ms=budget_ms)
