@@ -18,11 +18,25 @@ message Capabilities {
   map<string, string> metadata = 2;
 }
 
+// A2A (Agent-to-Agent) message structure
+// Follows JSON-RPC 2.0 specification with A2A extensions
+message A2AMessage {
+  string jsonrpc = 1;        // JSON-RPC version (must be "2.0")
+  string id = 2;             // Request ID (UUID)
+  string method = 3;         // Method name (e.g., "message/send")
+  string params_json = 4;    // JSON-encoded params containing the message
+}
+
 // Action request
+// Supports both legacy format (action/parameters) and new A2A format (message)
 message ActionRequest {
+  // Legacy fields (deprecated, kept for backward compatibility)
   string action = 1;
   map<string, string> parameters = 2;
   string request_id = 3;
+
+  // New A2A format field
+  A2AMessage message = 4;
 }
 
 // Action result

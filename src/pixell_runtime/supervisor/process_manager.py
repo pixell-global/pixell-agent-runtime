@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Optional, Dict, IO, Any
 import structlog
 
-from pixell_runtime.supervisor.models import AgentProcess, AgentStatus, Ports
+from pixell_runtime.supervisor.models import AgentProcess, AgentStatus, Ports, SocketPathsModel
+from pixell_runtime.supervisor.socket_allocator import SocketPaths
 
 logger = structlog.get_logger()
 
@@ -62,18 +63,28 @@ class ProcessManager:
         agent_app_id: str,
         linux_user: str,
         package_path: Path,
-        ports: Ports,
+        ports: Optional[Ports] = None,
+        socket_paths: Optional[SocketPaths] = None,
+        socket_mode: bool = False,
         venv_path: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         package_env: Optional[Dict[str, str]] = None,
     ) -> int:
         """Spawn an agent process as a specific Linux user.
 
+        IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+        DEPRECATED: socket_mode=False (TCP ports) is deprecated and should NEVER be activated.
+        Port mode has hard capacity limits (200 agents max) and is being phased out.
+        All new deployments MUST use socket_mode=True.
+
         Args:
             agent_app_id: Agent identifier
             linux_user: Linux username to run as
             package_path: Path to extracted agent package directory
-            ports: Ports allocation for the agent
+            ports: DEPRECATED - Port allocation (required if socket_mode=False). DO NOT USE.
+            socket_paths: Socket paths for the agent (required for socket_mode=True - the only supported mode)
+            socket_mode: MUST be True. socket_mode=False is DEPRECATED and should never be used.
+            venv_path: Virtual environment path (optional)
             env: Additional environment variables from DeployRequest (highest priority)
             package_env: Environment variables from agent.yaml + deploy.json (medium priority)
 
@@ -82,14 +93,41 @@ class ProcessManager:
 
         Raises:
             RuntimeError: If process spawn fails
+            ValueError: If socket_mode and ports/socket_paths are inconsistent
         """
-        logger.info(
-            "Spawning agent process",
-            agent_app_id=agent_app_id,
-            user=linux_user,
-            package=str(package_path),
-            ports={"rest": ports.rest, "a2a": ports.a2a, "ui": ports.ui},
-        )
+        # Validate inputs
+        if socket_mode:
+            if socket_paths is None:
+                raise ValueError("socket_mode=True requires socket_paths")
+            if ports is not None:
+                raise ValueError("socket_mode=True but ports provided")
+            logger.info(
+                "Spawning agent process (socket mode)",
+                agent_app_id=agent_app_id,
+                user=linux_user,
+                package=str(package_path),
+                sockets={
+                    "rest": str(socket_paths.rest),
+                    "a2a": str(socket_paths.a2a),
+                    "ui": str(socket_paths.ui),
+                },
+            )
+        else:
+            # DEPRECATED: Port mode (socket_mode=False) should never be used.
+            # This branch exists only for backwards compatibility.
+            # TODO: Remove port mode support once all agents use socket mode.
+            if ports is None:
+                raise ValueError("socket_mode=False requires ports")
+            if socket_paths is not None:
+                raise ValueError("socket_mode=False but socket_paths provided")
+            logger.warning(
+                "Spawning agent process (port mode - DEPRECATED)",
+                agent_app_id=agent_app_id,
+                user=linux_user,
+                package=str(package_path),
+                ports={"rest": ports.rest, "a2a": ports.a2a, "ui": ports.ui},
+                deprecation_note="Port mode should not be used. Migrate to socket_mode=True."
+            )
 
         # Determine home directory for agent user
         # Format: /home/agent_xxx where xxx matches linux_user suffix
@@ -103,14 +141,28 @@ class ProcessManager:
             "AGENT_PACKAGE_PATH": str(package_path),
             # NOTE: PACKAGE_URL not set - runtime will use AGENT_PACKAGE_PATH instead
             # Runtime validation rejects file:// URLs, and AGENT_PACKAGE_PATH is preferred
-            "REST_PORT": str(ports.rest),
-            "A2A_PORT": str(ports.a2a),
-            "UI_PORT": str(ports.ui),
             "BASE_PATH": f"/agents/{agent_app_id}",
             "MULTIPLEXED": "true",
             "PYTHONUNBUFFERED": "1",  # Ensure logs are not buffered
             "HOME": home_dir,  # Set HOME for agent user (UV/pip need this for cache)
         }
+
+        # Set socket or port environment variables based on mode
+        # IMPORTANT: socket_mode=True is the ONLY supported mode.
+        # DEPRECATED: socket_mode=False (ports) should never be activated.
+        if socket_mode:
+            # PREFERRED: Unix domain socket mode
+            process_env["SOCKET_MODE"] = "true"
+            process_env["REST_SOCKET"] = str(socket_paths.rest)
+            process_env["A2A_SOCKET"] = str(socket_paths.a2a)
+            process_env["UI_SOCKET"] = str(socket_paths.ui)
+        else:
+            # DEPRECATED: Port mode - DO NOT USE
+            # TODO: Remove this branch once all agents use socket mode.
+            process_env["SOCKET_MODE"] = "false"
+            process_env["REST_PORT"] = str(ports.rest)
+            process_env["A2A_PORT"] = str(ports.a2a)
+            process_env["UI_PORT"] = str(ports.ui)
         
         # Add virtual environment path if available
         if venv_path:
@@ -631,14 +683,26 @@ class ProcessManager:
             )
             raise RuntimeError(f"Failed to stop agent {agent_app_id}: {e}") from e
 
-    async def health_check(self, agent_app_id: str, ports: Ports) -> bool:
+    async def health_check(
+        self,
+        agent_app_id: str,
+        ports: Optional[Ports] = None,
+        socket_paths: Optional[SocketPaths] = None,
+        socket_mode: bool = False,
+    ) -> bool:
         """Perform health check on agent.
 
         Checks if agent's REST API responds to health endpoint.
 
+        IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+        DEPRECATED: socket_mode=False (TCP ports) is deprecated and should NEVER be activated.
+        Port mode has hard capacity limits (200 agents max) and is being phased out.
+
         Args:
             agent_app_id: Agent identifier
-            ports: Ports allocation for the agent
+            ports: DEPRECATED - Port allocation (required if socket_mode=False). DO NOT USE.
+            socket_paths: Socket paths for the agent (required for socket_mode=True - the only supported mode)
+            socket_mode: MUST be True. socket_mode=False is DEPRECATED and should never be used.
 
         Returns:
             True if healthy, False otherwise
@@ -652,48 +716,62 @@ class ProcessManager:
             # Check REST health endpoint
             import httpx
 
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                url = f"http://localhost:{ports.rest}/agents/{agent_app_id}/health"
-                response = await client.get(url)
+            if socket_mode:
+                if socket_paths is None:
+                    logger.error("socket_mode=True but socket_paths not provided")
+                    return False
+                # Use Unix socket transport
+                transport = httpx.AsyncHTTPTransport(uds=str(socket_paths.rest))
+                async with httpx.AsyncClient(transport=transport, timeout=2.0) as client:
+                    # For UDS, the URL host doesn't matter, but path does
+                    url = f"http://localhost/agents/{agent_app_id}/health"
+                    response = await client.get(url)
+            else:
+                if ports is None:
+                    logger.error("socket_mode=False but ports not provided")
+                    return False
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    url = f"http://localhost:{ports.rest}/agents/{agent_app_id}/health"
+                    response = await client.get(url)
 
-                # Log response details
-                try:
-                    response_data = response.json()
-                except Exception:
-                    response_data = {"raw_text": response.text[:200]}  # Truncate if too long
+            # Log response details (common to both socket and port modes)
+            try:
+                response_data = response.json()
+            except Exception:
+                response_data = {"raw_text": response.text[:200]}  # Truncate if too long
 
-                if response.status_code == 200:
-                    status_ok = False
-                    if response_data.get("status") == "healthy":
-                        status_ok = True
-                    elif isinstance(response_data.get("ok"), bool):
-                        status_ok = response_data.get("ok") is True
+            if response.status_code == 200:
+                status_ok = False
+                if response_data.get("status") == "healthy":
+                    status_ok = True
+                elif isinstance(response_data.get("ok"), bool):
+                    status_ok = response_data.get("ok") is True
 
-                    if status_ok:
-                        logger.info(
-                            "Agent health check passed",
-                            agent_app_id=agent_app_id,
-                            response=response_data,
-                        )
-                        return True
-                    else:
-                        # 200 OK but status is not "healthy"
-                        logger.warning(
-                            "Agent health check returned 200 but status is not healthy",
-                            agent_app_id=agent_app_id,
-                            status_code=response.status_code,
-                            response=response_data,
-                        )
-                        return False
+                if status_ok:
+                    logger.info(
+                        "Agent health check passed",
+                        agent_app_id=agent_app_id,
+                        response=response_data,
+                    )
+                    return True
+                else:
+                    # 200 OK but status is not "healthy"
+                    logger.warning(
+                        "Agent health check returned 200 but status is not healthy",
+                        agent_app_id=agent_app_id,
+                        status_code=response.status_code,
+                        response=response_data,
+                    )
+                    return False
 
-                # Non-200 status code
-                logger.warning(
-                    "Agent health check failed",
-                    agent_app_id=agent_app_id,
-                    status_code=response.status_code,
-                    response=response_data,
-                )
-                return False
+            # Non-200 status code
+            logger.warning(
+                "Agent health check failed",
+                agent_app_id=agent_app_id,
+                status_code=response.status_code,
+                response=response_data,
+            )
+            return False
 
         except Exception as e:
             logger.warning(

@@ -21,9 +21,11 @@ from pixell_runtime.supervisor.models import (
     UpdateRequest,
     DeleteRequest,
     Ports,
+    SocketPathsModel,
 )
 from pixell_runtime.supervisor.user_manager import LinuxUserManager
 from pixell_runtime.supervisor.port_allocator import PortAllocator
+from pixell_runtime.supervisor.socket_allocator import SocketAllocator
 from pixell_runtime.supervisor.package_downloader import PackageDownloader
 from pixell_runtime.supervisor.process_manager import ProcessManager
 from pixell_runtime.agents.loader import PackageLoader
@@ -47,6 +49,7 @@ class SupervisorState:
         self,
         user_manager: Optional[LinuxUserManager] = None,
         port_allocator: Optional[PortAllocator] = None,
+        socket_allocator: Optional[SocketAllocator] = None,
         package_downloader: Optional[PackageDownloader] = None,
         process_manager: Optional[ProcessManager] = None,
     ):
@@ -55,11 +58,13 @@ class SupervisorState:
         Args:
             user_manager: LinuxUserManager instance (default: creates new)
             port_allocator: PortAllocator instance (default: creates new)
+            socket_allocator: SocketAllocator instance (default: creates new)
             package_downloader: PackageDownloader instance (default: creates new)
             process_manager: ProcessManager instance (default: creates new)
         """
         self.user_manager = user_manager or LinuxUserManager()
         self.port_allocator = port_allocator or PortAllocator()
+        self.socket_allocator = socket_allocator or SocketAllocator()
         self.package_downloader = package_downloader or PackageDownloader()
         self.process_manager = process_manager or ProcessManager()
 
@@ -655,32 +660,66 @@ class SupervisorState:
 
             logger.info("Created Linux user", agent_app_id=agent_app_id, user=username)
 
-            # Step 2: Handle port allocation
-            # Use PAC-provided ports if available, otherwise allocate internally
-            if request.ports:
-                # PAC provided ports - use them directly (DO NOT ALLOCATE)
-                ports = request.ports
+            # Step 2: Handle port/socket allocation based on socket_mode
+            # IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+            # DEPRECATED: socket_mode=False (TCP ports) is deprecated and should NEVER be activated.
+            # Port mode has hard capacity limits (200 agents max) and is being phased out.
+            ports = None
+            socket_paths = None
+            socket_paths_model = None
+
+            if request.socket_mode:
+                # PREFERRED: Socket mode - allocate Unix domain socket paths
+                # This is the only mode that should be used in production.
+                socket_paths = self.socket_allocator.create_agent_directory(
+                    agent_app_id,
+                    owner=username,
+                    group="nginx",  # Nginx needs access to proxy to sockets
+                    short_id=request.agent_short_id,  # Use PAC-provided short_id for directory name
+                )
+                socket_paths_model = SocketPathsModel(
+                    base_dir=str(socket_paths.base_dir),
+                    rest=str(socket_paths.rest),
+                    a2a=str(socket_paths.a2a),
+                    ui=str(socket_paths.ui),
+                )
                 logger.info(
-                    "Using PAC-provided ports",
+                    "Allocated socket paths",
+                    agent_app_id=agent_app_id,
+                    base_dir=str(socket_paths.base_dir),
+                    rest=str(socket_paths.rest),
+                    a2a=str(socket_paths.a2a),
+                    ui=str(socket_paths.ui),
+                    source="socket_allocator",
+                    note="Unlimited agent capacity via Unix sockets"
+                )
+            elif request.ports:
+                # DEPRECATED: Port mode - DO NOT USE
+                # Port mode has hard capacity limits and should never be activated.
+                # TODO: Remove port mode support once all agents use socket mode.
+                ports = request.ports
+                logger.warning(
+                    "Using PAC-provided ports (DEPRECATED)",
                     agent_app_id=agent_app_id,
                     rest=ports.rest,
                     a2a=ports.a2a,
                     ui=ports.ui,
                     source="pac",
-                    note="PAC manages port lifecycle"
+                    deprecation_note="Port mode is deprecated. Migrate to socket_mode=True."
                 )
             else:
-                # Backward compatibility: allocate ports internally
+                # DEPRECATED: Backward compatibility - allocate ports internally
                 # This path is for old PAC versions or testing without PAC
+                # DO NOT USE - migrate to socket_mode=True instead.
                 ports = self.port_allocator.allocate(agent_app_id)
                 logger.warning(
-                    "PAC did not provide ports, allocated internally",
+                    "PAC did not provide ports, allocated internally (DEPRECATED)",
                     agent_app_id=agent_app_id,
                     rest=ports.rest,
                     a2a=ports.a2a,
                     ui=ports.ui,
                     source="par_internal",
-                    note="Consider upgrading PAC to use centralized allocation"
+                    deprecation_note="Port mode is deprecated. Migrate to socket_mode=True."
                 )
 
             # Create agent process record with allocated resources
@@ -689,7 +728,9 @@ class SupervisorState:
                 agent_app_id=agent_app_id,
                 deployment_id=request.deployment_id,
                 status=AgentStatus.STARTING,
+                socket_mode=request.socket_mode,
                 ports=ports,
+                socket_paths=socket_paths_model,
                 linux_user=username,
                 package_path="",  # Will update after download
                 package_url=request.package_url,
@@ -781,6 +822,8 @@ class SupervisorState:
                 linux_user=username,
                 package_path=extracted_dir,
                 ports=ports,
+                socket_paths=socket_paths,
+                socket_mode=request.socket_mode,
                 env=request.env,
                 package_env=package_env,
             )
@@ -1083,12 +1126,23 @@ class SupervisorState:
                     package_env_count=len(package_env),
                 )
 
-            # Spawn new process
+            # Spawn new process - convert socket_paths_model to SocketPaths if in socket mode
+            socket_paths = None
+            if agent_process.socket_mode and agent_process.socket_paths:
+                from pixell_runtime.supervisor.socket_allocator import SocketPaths
+                socket_paths = SocketPaths(
+                    base_dir=Path(agent_process.socket_paths.base_dir),
+                    rest=Path(agent_process.socket_paths.rest),
+                    a2a=Path(agent_process.socket_paths.a2a),
+                    ui=Path(agent_process.socket_paths.ui),
+                )
             pid = self.process_manager.spawn_agent(
                 agent_app_id=agent_app_id,
                 linux_user=agent_process.linux_user,
                 package_path=extracted_dir,
                 ports=agent_process.ports,
+                socket_paths=socket_paths,
+                socket_mode=agent_process.socket_mode,
                 env=request.env or {},
                 package_env=package_env,
             )
@@ -1182,14 +1236,24 @@ class SupervisorState:
             )
             logger.info("Cleaned agent files", agent_app_id=agent_app_id)
 
+            # Clean up socket directory if agent was in socket mode
+            if agent_process.socket_mode:
+                cleanup_result = self.socket_allocator.cleanup(agent_app_id)
+                logger.info(
+                    "Cleaned up socket directory",
+                    agent_app_id=agent_app_id,
+                    cleaned=cleanup_result,
+                )
+
             # IMPORTANT: DO NOT release ports - PAC manages port lifecycle
             # Old code removed: self.port_allocator.release(agent_app_id)
-            logger.info(
-                "Ports NOT released by PAR - PAC manages port lifecycle",
-                agent_app_id=agent_app_id,
-                ports={"rest": agent_process.ports.rest, "a2a": agent_process.ports.a2a, "ui": agent_process.ports.ui},
-                note="PAC will release ports in database"
-            )
+            if agent_process.ports:
+                logger.info(
+                    "Ports NOT released by PAR - PAC manages port lifecycle",
+                    agent_app_id=agent_app_id,
+                    ports={"rest": agent_process.ports.rest, "a2a": agent_process.ports.a2a, "ui": agent_process.ports.ui},
+                    note="PAC will release ports in database"
+                )
 
             # Delete Linux user ONLY if explicitly requested
             if request.cleanup_user:

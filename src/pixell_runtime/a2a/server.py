@@ -401,6 +401,7 @@ def _load_agent_service(package: AgentPackage) -> tuple:
 def create_grpc_server(
     package: Optional[AgentPackage] = None,
     port: int = 50052,
+    socket_path: Optional[str] = None,
     agent_a2a_port: Optional[int] = None,
     agent_id: Optional[str] = None
 ) -> grpc.aio.Server:
@@ -411,9 +412,14 @@ def create_grpc_server(
     2. Handlers Dict: Agent provides action handlers, PAR dispatches via AgentServiceImpl
     3. Subprocess Forwarding: Agent runs own gRPC server, PAR forwards via AgentServiceImpl
 
+    Supports both TCP port binding and Unix domain socket binding:
+    - If socket_path is provided, binds to the Unix socket
+    - Otherwise, binds to 0.0.0.0:{port}
+
     Args:
         package: Optional agent package with a2a service
-        port: Port to bind the server to (default: 50052)
+        port: Port to bind the server to (default: 50052, ignored if socket_path provided)
+        socket_path: Unix domain socket path for binding (optional, takes precedence over port)
         agent_a2a_port: Port for forwarding to agent's subprocess gRPC server (Pattern 3)
         agent_id: Agent app ID for path-based routing interceptor (NEW)
 
@@ -493,17 +499,37 @@ def create_grpc_server(
     # Add service to server
     agent_pb2_grpc.add_AgentServiceServicer_to_server(service_impl, server)
 
-    # Configure server
-    # Bind on IPv4 to avoid environments without IPv6
-    listen_addr = f'0.0.0.0:{port}'
-    server.add_insecure_port(listen_addr)
+    # Configure server - bind to socket or port
+    if socket_path:
+        # Unix domain socket binding
+        from pathlib import Path as PathLib
+        sock_path = PathLib(socket_path)
 
-    logger.info(
-        "Created A2A gRPC server",
-        port=port,
-        listen_addr=listen_addr,
-        servicer_type=type(service_impl).__name__
-    )
+        # Remove stale socket file if it exists
+        if sock_path.exists():
+            logger.info("Removing stale gRPC socket", socket=socket_path)
+            sock_path.unlink()
+
+        listen_addr = f'unix:{socket_path}'
+        server.add_insecure_port(listen_addr)
+
+        logger.info(
+            "Created A2A gRPC server (socket mode)",
+            socket=socket_path,
+            listen_addr=listen_addr,
+            servicer_type=type(service_impl).__name__
+        )
+    else:
+        # TCP port binding (IPv4 to avoid environments without IPv6)
+        listen_addr = f'0.0.0.0:{port}'
+        server.add_insecure_port(listen_addr)
+
+        logger.info(
+            "Created A2A gRPC server (port mode)",
+            port=port,
+            listen_addr=listen_addr,
+            servicer_type=type(service_impl).__name__
+        )
 
     return server
 
