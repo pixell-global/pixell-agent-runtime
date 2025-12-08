@@ -221,30 +221,36 @@ log_info "✅ Wheel uploaded to $S3_URL"
 log_step "5/7" "Installing PAR on EC2..."
 
 # Execute installation directly via SSM (no separate script file)
+# NOTE: We install to BOTH supervisor venv AND system site-packages because:
+#   - Supervisor runs from venv: /opt/pixell-agent-runtime/venv/bin/python
+#   - Agents run from system python: /usr/bin/python3.11 -m pixell_runtime
 COMMAND_ID=$(aws ssm send-command \
     --region "$AWS_REGION" \
     --instance-ids "$INSTANCE_ID" \
     --document-name "AWS-RunShellScript" \
     --parameters "{\"commands\":[
 \"set -e\",
-\"echo '[1/6] Downloading wheel from S3...'\",
+\"echo '[1/7] Downloading wheel from S3...'\",
 \"aws s3 cp '$S3_URL' /tmp/'$WHEEL_FILENAME' --region '$AWS_REGION'\",
-\"echo '[2/6] Installing Python 3.11 if needed...'\",
+\"echo '[2/7] Installing Python 3.11 if needed...'\",
 \"sudo yum install -y python3.11 python3.11-pip python3.11-devel 2>/dev/null || echo 'Already installed'\",
-\"echo '[3/6] Uninstalling old version...'\",
-\"sudo pip3.11 uninstall -y pixell-runtime 2>/dev/null || echo 'No old version'\",
-\"echo '[4/6] Installing new wheel...'\",
-\"sudo pip3.11 install /tmp/'$WHEEL_FILENAME'\",
-\"echo '[5/6] Updating supervisor configuration...'\",
+\"echo '[3/7] Uninstalling old version from venv...'\",
+\"sudo /opt/pixell-agent-runtime/venv/bin/pip uninstall -y pixell-runtime 2>/dev/null || echo 'No old version'\",
+\"echo '[4/7] Installing new wheel into supervisor venv...'\",
+\"sudo /opt/pixell-agent-runtime/venv/bin/pip install /tmp/'$WHEEL_FILENAME'\",
+\"echo '[5/7] Installing new wheel into system site-packages (for agents)...'\",
+\"sudo /usr/bin/pip3.11 install --upgrade /tmp/'$WHEEL_FILENAME'\",
+\"echo '[6/7] Updating supervisor configuration...'\",
 \"sudo sed -i 's/^PORT=.*/SUPERVISOR_PORT=9000/' /etc/par-supervisor.conf\",
 \"echo 'Updated SUPERVISOR_PORT to 9000'\",
 \"cat /etc/par-supervisor.conf | grep SUPERVISOR_PORT\",
-\"echo '[6/6] Restarting supervisor service...'\",
+\"echo '[7/7] Restarting supervisor service...'\",
 \"sudo systemctl daemon-reload\",
 \"sudo systemctl restart par-supervisor\",
 \"sleep 3\",
 \"sudo systemctl is-active par-supervisor && echo 'Service active' || echo 'Service failed'\",
-\"pip3.11 show pixell-runtime | grep Version\"
+\"echo 'Supervisor venv:' && /opt/pixell-agent-runtime/venv/bin/pip show pixell-runtime | grep Version\",
+\"echo 'System site-packages:' && /usr/bin/pip3.11 show pixell-runtime | grep Version\"
 ]}" \
     --comment "Install PAR $EXPECTED_VERSION" \
     --query 'Command.CommandId' \
@@ -300,7 +306,7 @@ VERIFY_CMD=$(aws ssm send-command \
     --region "$AWS_REGION" \
     --instance-ids "$INSTANCE_ID" \
     --document-name "AWS-RunShellScript" \
-    --parameters '{"commands":["pip3.11 show pixell-runtime | grep Version"]}' \
+    --parameters '{"commands":["/opt/pixell-agent-runtime/venv/bin/pip show pixell-runtime | grep Version"]}' \
     --comment "Verify PAR version" \
     --query 'Command.CommandId' \
     --output text)

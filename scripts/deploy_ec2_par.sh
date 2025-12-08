@@ -233,8 +233,11 @@ COMMAND_ID=$(aws ssm send-command \
 \"sudo yum install -y python3.11 python3.11-pip python3.11-devel 2>/dev/null || echo 'Already installed'\",
 \"echo '[3/6] Uninstalling old version...'\",
 \"sudo pip3.11 uninstall -y pixell-runtime 2>/dev/null || echo 'No old version'\",
-\"echo '[4/6] Installing new wheel...'\",
+\"if [ -d /opt/pixell-agent-runtime/venv ]; then sudo /opt/pixell-agent-runtime/venv/bin/pip uninstall -y pixell-runtime 2>/dev/null || echo 'No old version in venv'; fi\",
+\"echo '[4/6] Installing new wheel (system-wide)...'\",
 \"sudo pip3.11 install /tmp/'$WHEEL_FILENAME'\",
+\"echo '[4.5/6] Installing into agent runtime venv if exists...'\",
+\"if [ -d /opt/pixell-agent-runtime/venv ]; then sudo /opt/pixell-agent-runtime/venv/bin/pip install /tmp/'$WHEEL_FILENAME' && echo 'Installed to /opt/pixell-agent-runtime/venv'; else echo 'No agent runtime venv found'; fi\",
 \"echo '[5/6] Updating supervisor configuration...'\",
 \"sudo sed -i 's/^PORT=.*/SUPERVISOR_PORT=9000/' /etc/par-supervisor.conf\",
 \"echo 'Updated SUPERVISOR_PORT to 9000'\",
@@ -300,19 +303,24 @@ VERIFY_CMD=$(aws ssm send-command \
     --region "$AWS_REGION" \
     --instance-ids "$INSTANCE_ID" \
     --document-name "AWS-RunShellScript" \
-    --parameters '{"commands":["pip3.11 show pixell-runtime | grep Version"]}' \
+    --parameters '{"commands":["echo SYSTEM:","pip3.11 show pixell-runtime | grep Version","echo VENV:","/opt/pixell-agent-runtime/venv/bin/pip show pixell-runtime 2>/dev/null | grep Version || echo Version: not-installed"]}' \
     --comment "Verify PAR version" \
     --query 'Command.CommandId' \
     --output text)
 
 sleep 3
 
-INSTALLED_VERSION=$(aws ssm get-command-invocation \
+VERIFY_OUTPUT=$(aws ssm get-command-invocation \
     --region "$AWS_REGION" \
     --command-id "$VERIFY_CMD" \
     --instance-id "$INSTANCE_ID" \
     --query 'StandardOutputContent' \
-    --output text | grep 'Version:' | awk '{print $2}' || echo "unknown")
+    --output text)
+
+log_info "Version check output:"
+echo "$VERIFY_OUTPUT"
+
+INSTALLED_VERSION=$(echo "$VERIFY_OUTPUT" | grep 'Version:' | head -1 | awk '{print $2}' || echo "unknown")
 
 if [ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]; then
     log_error "Installed version mismatch!"
