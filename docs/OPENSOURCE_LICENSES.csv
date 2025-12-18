@@ -1,0 +1,31 @@
+오픈소스 이름,활용 내용,라이선스,링크
+FastAPI,Async web framework for building APIs. Used for Supervisor API server (port 9000) and REST endpoints.,MIT,https://github.com/tiangolo/fastapi
+Uvicorn,ASGI server implementation. Runs FastAPI applications with HTTP/2 and WebSocket support.,BSD-3-Clause,https://github.com/encode/uvicorn
+Pydantic,Data validation and serialization. Used for request/response models (DeployRequest AgentManifest etc).,MIT,https://github.com/pydantic/pydantic
+Pydantic-Settings,Settings management using environment variables. Loads application configuration.,MIT,https://github.com/pydantic/pydantic-settings
+HTTPX,Async HTTP client library. Downloads apkg files from HTTPS URLs.,BSD-3-Clause,https://github.com/encode/httpx
+Boto3,AWS SDK for Python. Downloads apkg from S3. CodeArtifact authentication. EC2/ECS operations.,Apache-2.0,https://github.com/boto/boto3
+PyYAML,YAML parser and emitter. Reads agent.yaml manifests and deployment configurations.,MIT,https://github.com/yaml/pyyaml
+Prometheus-Client,Prometheus instrumentation library. Collects metrics for deployment counts request latency agent status.,Apache-2.0,https://github.com/prometheus/client_python
+Python-Jose,JOSE implementation for JWT. Token generation and validation for secure authentication.,MIT,https://github.com/mpdavis/python-jose
+Python-Multipart,Parser for multipart/form-data. Supports file uploads in FastAPI endpoints.,Apache-2.0,https://github.com/andrew-d/python-multipart
+Structlog,Structured logging library. Provides consistent structured logs with context across all components.,MIT / Apache-2.0,https://github.com/hynek/structlog
+AIOFiles,Async file operations. Non-blocking file I/O for logs and package extraction.,Apache-2.0,https://github.com/Tinche/aiofiles
+Cryptography,Cryptographic primitives and recipes. TLS/SSL operations SHA256 hashing secure key generation.,Apache-2.0 / BSD-3-Clause,https://github.com/pyca/cryptography
+gRPC,High-performance RPC framework. A2A (Agent-to-Agent) communication and GrpcGateway implementation.,Apache-2.0,https://github.com/grpc/grpc
+gRPC-Tools,Protobuf compiler and code generator. Generates Python code from .proto files (agent_pb2.py).,Apache-2.0,https://github.com/grpc/grpc
+Protobuf,Protocol Buffers serialization. A2A message serialization (A2AMessage ActionResult InvokeRequest).,BSD-3-Clause,https://github.com/protocolbuffers/protobuf
+PSUtil,Cross-platform process and system utilities. Agent process management resource monitoring zombie detection.,BSD-3-Clause,https://github.com/giampaolo/psutil
+Click,Command-line interface creation toolkit. CLI commands for pixell-runtime with argument parsing.,BSD-3-Clause,https://github.com/pallets/click
+Pytest,Testing framework. Unit tests and integration tests for supervisor and A2A components.,MIT,https://github.com/pytest-dev/pytest
+Pytest-Asyncio,Pytest plugin for async tests. Testing async functions and event loop management in tests.,Apache-2.0,https://github.com/pytest-dev/pytest-asyncio
+Pytest-Cov,Coverage plugin for Pytest. Code coverage reporting to ensure test completeness.,MIT,https://github.com/pytest-dev/pytest-cov
+Moto,AWS service mocking library. Mocks S3 operations for testing without real AWS resources.,Apache-2.0,https://github.com/getmoto/moto
+MyPy,Static type checker for Python. Catches type errors before runtime.,MIT,https://github.com/python/mypy
+Ruff,Fast Python linter written in Rust. Code quality checks (pycodestyle pyflakes isort flake8-bugbear).,MIT,https://github.com/astral-sh/ruff
+Black,Opinionated code formatter. Maintains consistent code style automatically.,MIT,https://github.com/psf/black
+Isort,Import statement sorter. Organizes and sorts Python imports.,MIT,https://github.com/PyCQA/isort
+Pre-Commit,Git hook manager. Runs linters and formatters automatically before commits.,MIT,https://github.com/pre-commit/pre-commit
+Types-PyYAML,Type stubs for PyYAML. Enables MyPy type checking with PyYAML.,Apache-2.0,https://github.com/python/typeshed
+Types-AIOFiles,Type stubs for AIOFiles. Enables MyPy type checking with AIOFiles.,Apache-2.0,https://github.com/python/typeshed
+Boto3-Stubs,Type stubs for Boto3. Enables MyPy type checking with Boto3 S3 operations.,MIT,https://github.com/youtype/mypy_boto3_builder

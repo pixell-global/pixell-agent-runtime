@@ -1,0 +1,2 @@
+# No external dependencies required
+# This agent uses only Python standard library + PAR's built-in dependencies

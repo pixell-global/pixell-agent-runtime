@@ -1,0 +1,30 @@
+version: "1.0.0"
+name: "echo-streamer"
+display_name: "Echo Streamer"
+description: "Minimal A2A streaming agent for load testing - echoes messages word by word"
+author: "Pixell Team"
+license: "AGPL-3.0"
+
+runtime: "python3.11"
+
+# A2A surface - uses UNIX DOMAIN SOCKETS (not ports)
+a2a:
+  http_server: "src.agent:create_service"
+
+capabilities:
+  - "chat"
+  - "streaming"
+
+environment:
+  PYTHONUNBUFFERED: "1"
+
+# Required metadata section
+metadata:
+  version: "1.0.0"
+  tags:
+    - "echo"
+    - "streaming"
+    - "load-test"
+
+# NO PORT CONFIGURATION - sockets only
+# Agent will listen on: /var/run/pixell-agents/agent_{short_id}/a2a.sock

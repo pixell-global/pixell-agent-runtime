@@ -22,9 +22,19 @@ def setup_ui_routes(app: FastAPI, package: AgentPackage, base_path_override: Opt
         app: FastAPI application
         package: Agent package with UI configuration
     """
+    logger.info("Setting up UI routes", package_id=package.id, has_ui_config=bool(package.manifest.ui))
+    
     if not package.manifest.ui or not package.manifest.ui.path:
-        logger.warning("No UI configuration found in package")
+        logger.warning("No UI configuration found in package", 
+                     package_id=package.id,
+                     has_manifest_ui=bool(package.manifest.ui),
+                     ui_path=getattr(package.manifest.ui, 'path', None) if package.manifest.ui else None)
         return
+    
+    logger.info("UI configuration found", 
+               package_id=package.id,
+               ui_path=package.manifest.ui.path,
+               ui_base_path=getattr(package.manifest.ui, 'basePath', None))
     
     ui_path = Path(package.path) / package.manifest.ui.path
     # Compose base path from environment BASE_PATH (or override) and manifest.ui.basePath
@@ -58,6 +68,15 @@ def setup_ui_routes(app: FastAPI, package: AgentPackage, base_path_override: Opt
             name="ui_static"
         )
     
+    # Mount assets directory (for React/Vite builds)
+    assets_dir = ui_path / "assets"
+    if assets_dir.exists() and assets_dir.is_dir():
+        app.mount(
+            f"{base_path}assets",
+            StaticFiles(directory=str(assets_dir)),
+            name="ui_assets"
+        )
+    
     # Provide runtime configuration for the UI to discover API base
     @app.get(f"{base_path}ui-config.json")
     async def ui_config():
@@ -89,6 +108,22 @@ def setup_ui_routes(app: FastAPI, package: AgentPackage, base_path_override: Opt
         if index_file.exists():
             return FileResponse(str(index_file))
 
+        raise HTTPException(status_code=404, detail="UI not found")
+
+    # Serve UI at root path as well (for direct access)
+    @app.get(f"{base_path}")
+    async def serve_ui_root(request: Request):
+        """Serve UI at root path, but only if no other routes match."""
+        # Check if this is a request for reserved endpoints
+        path = request.url.path
+        if path in ["/health", "/meta", "/a2a/health", "/ui/health", "/ui-config.json"]:
+            raise HTTPException(status_code=404)
+        
+        # Serve index.html for root path
+        index_file = ui_path / "index.html"
+        if index_file.exists():
+            return FileResponse(str(index_file))
+        
         raise HTTPException(status_code=404, detail="UI not found")
 
 

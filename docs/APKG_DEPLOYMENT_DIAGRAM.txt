@@ -1,0 +1,317 @@
+===============================================================================
+PIXELL AGENT RUNTIME - APKG DEPLOYMENT FLOW
+===============================================================================
+
+This diagram illustrates how the Pixell Agent Runtime deploys agent packages
+(.apkg files) from initial request through to a running agent process.
+
+Key Components:
+- Supervisor (port 9000): Orchestrates deployments
+- Linux User Manager: Creates isolated system users
+- Package Downloader: Downloads and caches packages from S3/HTTPS
+- Process Manager: Spawns agent processes with user isolation
+- Package Loader: Creates venvs and installs dependencies
+
+===============================================================================
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│ PIXELL AGENT CLOUD (PAC) - Control Plane                                  │
+│ Sends deployment request: POST /agents                                    │
+└─────────────────────────────┬──────────────────────────────────────────────┘
+                              │
+                              │ HTTP POST /agents
+                              │ {
+                              │   agent_app_id: "4906eeb7-9959-414e-84c6-f2445822ebe4"
+                              │   package_url: "s3://bucket/agent.apkg"
+                              │   ports: {rest: 63000, a2a: 60000, ui: 65000}
+                              │ }
+                              ▼
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ EC2 INSTANCE: i-09dcb7f387166efd0 (10.0.1.37)                          ┃
+┃ ────────────────────────────────────────────────────────────────────── ┃
+┃                                                                         ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 1: SUPERVISOR RECEIVES REQUEST                             │  ┃
+┃  │ File: src/pixell_runtime/supervisor/server.py                   │  ┃
+┃  │ Port: 9000                                                       │  ┃
+┃  │                                                                  │  ┃
+┃  │ @app.post("/agents")                                            │  ┃
+┃  │ async def deploy_agent(request: DeployRequest)                  │  ┃
+┃  │   → Triggers SupervisorState.deploy()                           │  ┃
+┃  └───────────────────────┬─────────────────────────────────────────┘  ┃
+┃                          │                                             ┃
+┃                          ▼                                             ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 2: CREATE LINUX USER                                       │  ┃
+┃  │ File: src/pixell_runtime/supervisor/user_manager.py:97-207     │  ┃
+┃  │                                                                  │  ┃
+┃  │ LinuxUserManager.create_user()                                  │  ┃
+┃  │   ├─ Generate username: agent_4906eeb7                          │  ┃
+┃  │   ├─ Run: useradd --system \                                    │  ┃
+┃  │   │              --shell /bin/false \                           │  ┃
+┃  │   │              --home-dir /home/agent_4906eeb7 \              │  ┃
+┃  │   │              --create-home \                                │  ┃
+┃  │   │              agent_4906eeb7                                 │  ┃
+┃  │   ├─ Create directories:                                        │  ┃
+┃  │   │    /home/agent_4906eeb7/                                    │  ┃
+┃  │   │    /home/agent_4906eeb7/venv/                               │  ┃
+┃  │   │    /home/agent_4906eeb7/packages/                           │  ┃
+┃  │   │    /home/agent_4906eeb7/logs/                               │  ┃
+┃  │   │    /home/agent_4906eeb7/cache/                              │  ┃
+┃  │   └─ Security: No login shell, isolated from other agents      │  ┃
+┃  └───────────────────────┬─────────────────────────────────────────┘  ┃
+┃                          │                                             ┃
+┃                          ▼                                             ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 3: ALLOCATE PORTS                                          │  ┃
+┃  │ File: src/pixell_runtime/supervisor/state.py:509-533           │  ┃
+┃  │                                                                  │  ┃
+┃  │ if request.ports:                                               │  ┃
+┃  │   # Use PAC-provided ports (production)                         │  ┃
+┃  │   ports = request.ports  # {rest: 63000, a2a: 60000, ui: 65000}│  ┃
+┃  │ else:                                                            │  ┃
+┃  │   # Allocate internally (legacy/testing)                        │  ┃
+┃  │   ports = PortAllocator.allocate()                              │  ┃
+┃  │                                                                  │  ┃
+┃  │ Port Ranges (200-agent capacity):                               │  ┃
+┃  │   REST:  63000-63199  (HTTP API)                                │  ┃
+┃  │   A2A:   60000-60199  (gRPC)                                    │  ┃
+┃  │   UI:    65000-65199  (Web UI)                                  │  ┃
+┃  └───────────────────────┬─────────────────────────────────────────┘  ┃
+┃                          │                                             ┃
+┃                          ▼                                             ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 4: DOWNLOAD APKG FILE                                      │  ┃
+┃  │ File: src/pixell_runtime/supervisor/package_downloader.py      │  ┃
+┃  │       :111-200                                                  │  ┃
+┃  │                                                                  │  ┃
+┃  │ PackageDownloader.download()                                    │  ┃
+┃  │   ├─ Calculate cache key: SHA256(package_url)[:16]             │  ┃
+┃  │   │    cache_key = "abc123def456"                               │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Check cache:                                               │  ┃
+┃  │   │    /var/lib/pixell/packages/abc123def456.apkg               │  ┃
+┃  │   │    └─ If exists & !force_refresh → return cached            │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Download from source:                                      │  ┃
+┃  │   │    if s3://bucket/key:                                      │  ┃
+┃  │   │      → Use boto3 S3 client                                  │  ┃
+┃  │   │    if https://domain/path:                                  │  ┃
+┃  │   │      → Use requests library                                 │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Validations:                                               │  ┃
+┃  │   │    • Max size: 100 MB (configurable)                        │  ┃
+┃  │   │    • SHA256 checksum (if provided)                          │  ┃
+┃  │   │    • Retry 3x with exponential backoff                      │  ┃
+┃  │   │                                                              │  ┃
+┃  │   └─ Save to: /var/lib/pixell/packages/abc123def456.apkg       │  ┃
+┃  └───────────────────────┬─────────────────────────────────────────┘  ┃
+┃                          │                                             ┃
+┃                          ▼                                             ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 5: EXTRACT APKG (ZIP ARCHIVE)                              │  ┃
+┃  │ File: src/pixell_runtime/supervisor/package_downloader.py      │  ┃
+┃  │       :202-351                                                  │  ┃
+┃  │                                                                  │  ┃
+┃  │ PackageDownloader.extract_package()                             │  ┃
+┃  │   ├─ Generate extraction key: SHA256(apkg_contents)[:16]       │  ┃
+┃  │   │    extraction_key = "xyz789abc123"                          │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Check if already extracted:                                │  ┃
+┃  │   │    /var/lib/pixell/extracted/xyz789abc123/                  │  ┃
+┃  │   │    └─ If agent.yaml exists → reuse extraction               │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Security: Zip-slip protection                              │  ┃
+┃  │   │    • Reject absolute paths                                  │  ┃
+┃  │   │    • Reject parent traversal (..)                           │  ┃
+┃  │   │    • Ensure files stay within extraction dir                │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Extract ZIP:                                               │  ┃
+┃  │   │    with zipfile.ZipFile(apkg_path) as zf:                   │  ┃
+┃  │   │      zf.extractall(extraction_dir)                          │  ┃
+┃  │   │                                                              │  ┃
+┃  │   └─ Result directory structure:                                │  ┃
+┃  │        /var/lib/pixell/extracted/xyz789abc123/                  │  ┃
+┃  │        ├── agent.yaml          (manifest)                       │  ┃
+┃  │        ├── requirements.txt    (dependencies)                   │  ┃
+┃  │        ├── deploy.json         (deployment config)              │  ┃
+┃  │        ├── setup.py            (optional)                       │  ┃
+┃  │        └── src/                (agent code)                     │  ┃
+┃  └───────────────────────┬─────────────────────────────────────────┘  ┃
+┃                          │                                             ┃
+┃                          ▼                                             ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 6: PREPARE ENVIRONMENT                                     │  ┃
+┃  │ File: src/pixell_runtime/supervisor/state.py:580-611           │  ┃
+┃  │                                                                  │  ┃
+┃  │ Merge environment variables (priority order):                   │  ┃
+┃  │   1. PAC env (highest)  ← from DeployRequest.env                │  ┃
+┃  │   2. deploy.json        ← from extracted package                │  ┃
+┃  │   3. agent.yaml         ← from package manifest                 │  ┃
+┃  │   4. System env (lowest)← from os.environ                       │  ┃
+┃  │                                                                  │  ┃
+┃  │ Fix ownership:                                                  │  ┃
+┃  │   chown -R agent_4906eeb7:agent_4906eeb7 \                      │  ┃
+┃  │          /var/lib/pixell/extracted/xyz789abc123/                │  ┃
+┃  └───────────────────────┬─────────────────────────────────────────┘  ┃
+┃                          │                                             ┃
+┃                          ▼                                             ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 7: SPAWN AGENT PROCESS                                     │  ┃
+┃  │ File: src/pixell_runtime/supervisor/process_manager.py:41-171  │  ┃
+┃  │                                                                  │  ┃
+┃  │ ProcessManager.spawn_agent()                                    │  ┃
+┃  │   ├─ Build process environment:                                 │  ┃
+┃  │   │    AGENT_APP_ID = "4906eeb7-9959-414e-84c6-f2445822ebe4"   │  ┃
+┃  │   │    AGENT_PACKAGE_PATH = "/var/lib/pixell/extracted/xyz..."  │  ┃
+┃  │   │    REST_PORT = "63000"                                      │  ┃
+┃  │   │    A2A_PORT = "60000"                                       │  ┃
+┃  │   │    UI_PORT = "65000"                                        │  ┃
+┃  │   │    BASE_PATH = "/agents/4906eeb7"                           │  ┃
+┃  │   │    HOME = "/home/agent_4906eeb7"                            │  ┃
+┃  │   │    PYTHONUNBUFFERED = "1"                                   │  ┃
+┃  │   │    + merged environment from agent.yaml/deploy.json/PAC     │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Create log file:                                           │  ┃
+┃  │   │    /var/lib/pixell/logs/agent_4906eeb7.log                  │  ┃
+┃  │   │                                                              │  ┃
+┃  │   └─ Spawn subprocess:                                          │  ┃
+┃  │        subprocess.Popen(                                         │  ┃
+┃  │          ["/usr/bin/python3.11", "-m", "pixell_runtime"],       │  ┃
+┃  │          user="agent_4906eeb7",   # ← Linux user isolation      │  ┃
+┃  │          stdout=log_handle,                                     │  ┃
+┃  │          stderr=subprocess.STDOUT,                              │  ┃
+┃  │          env=process_env                                        │  ┃
+┃  │        )                                                         │  ┃
+┃  └───────────────────────┬─────────────────────────────────────────┘  ┃
+┃                          │                                             ┃
+┃                          │ New process spawned with PID: 12345         ┃
+┃                          │ Running as: agent_4906eeb7                  ┃
+┃                          │                                             ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━┷━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                          │
+                          ▼
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ AGENT PROCESS (PID: 12345, User: agent_4906eeb7)                    ┃
+┃ Command: /usr/bin/python3.11 -m pixell_runtime                      ┃
+┃ ────────────────────────────────────────────────────────────────────── ┃
+┃                                                                         ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 8: CREATE VIRTUAL ENVIRONMENT                              │  ┃
+┃  │ File: src/pixell_runtime/agents/loader.py:666-839              │  ┃
+┃  │                                                                  │  ┃
+┃  │ PackageLoader._ensure_venv()                                    │  ┃
+┃  │   ├─ Calculate requirements hash:                               │  ┃
+┃  │   │    req_hash = SHA256(requirements.txt)[:16]                 │  ┃
+┃  │   │    req_hash = "req456def789"                                │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Generate venv path:                                        │  ┃
+┃  │   │    venv_path = /home/agent_4906eeb7/venv/4906eeb7_req456... │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Check if venv exists and is valid:                         │  ┃
+┃  │   │    if exists(venv_path/bin/python):                         │  ┃
+┃  │   │      if hash matches:                                       │  ┃
+┃  │   │        → Reuse existing venv (FAST PATH)                    │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Create new venv (if not reusing):                          │  ┃
+┃  │   │    import venv                                              │  ┃
+┃  │   │    venv.create(venv_path, with_pip=True, clear=True)        │  ┃
+┃  │   │                                                              │  ┃
+┃  │   └─ Venv structure:                                            │  ┃
+┃  │        /home/agent_4906eeb7/venv/4906eeb7_req456.../            │  ┃
+┃  │        ├── bin/                                                 │  ┃
+┃  │        │   ├── python      (symlink to python3.11)              │  ┃
+┃  │        │   ├── pip                                              │  ┃
+┃  │        │   └── activate                                         │  ┃
+┃  │        ├── lib/python3.11/site-packages/                        │  ┃
+┃  │        └── pyvenv.cfg                                           │  ┃
+┃  └───────────────────────┬─────────────────────────────────────────┘  ┃
+┃                          │                                             ┃
+┃                          ▼                                             ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 9: INSTALL AGENT PACKAGE (if setup.py exists)             │  ┃
+┃  │ File: src/pixell_runtime/agents/loader.py:722-773              │  ┃
+┃  │                                                                  │  ┃
+┃  │ if exists(package_path/setup.py):                               │  ┃
+┃  │   {venv_path}/bin/pip install -e {package_path}                 │  ┃
+┃  │                                                                  │  ┃
+┃  │ Result: Agent code installed as editable package                │  ┃
+┃  └───────────────────────┬─────────────────────────────────────────┘  ┃
+┃                          │                                             ┃
+┃                          ▼                                             ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 10: INSTALL DEPENDENCIES                                   │  ┃
+┃  │ File: src/pixell_runtime/agents/loader.py:457-664              │  ┃
+┃  │                                                                  │  ┃
+┃  │ PackageLoader._install_requirements()                           │  ┃
+┃  │   ├─ Check for 'uv' command (10-100x faster than pip)          │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Install with uv (preferred):                               │  ┃
+┃  │   │    uv pip install -r requirements.txt \                     │  ┃
+┃  │   │       --python {venv_path}/bin/python                       │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ OR install with pip (fallback):                            │  ┃
+┃  │   │    {venv_path}/bin/pip install -r requirements.txt          │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Optional: CodeArtifact integration                         │  ┃
+┃  │   │    if ENABLE_CODEARTIFACT=true:                             │  ┃
+┃  │   │      --index-url https://aws.codeartifact...                │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Optional: Local wheelhouse                                 │  ┃
+┃  │   │    --find-links /var/lib/pixell/wheelhouse/                 │  ┃
+┃  │   │                                                              │  ┃
+┃  │   ├─ Timeout: 5 minutes (300 seconds)                           │  ┃
+┃  │   │                                                              │  ┃
+┃  │   └─ Error handling:                                            │  ┃
+┃  │        • Package not found                                      │  ┃
+┃  │        • Hash verification failed                               │  ┃
+┃  │        • Version conflicts                                      │  ┃
+┃  │        • Network errors (retry 3x)                              │  ┃
+┃  └───────────────────────┬─────────────────────────────────────────┘  ┃
+┃                          │                                             ┃
+┃                          ▼                                             ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 11: START AGENT RUNTIME                                    │  ┃
+┃  │ File: src/pixell_runtime/agents/loader.py:52-151               │  ┃
+┃  │                                                                  │  ┃
+┃  │ PackageLoader.load_package()                                    │  ┃
+┃  │   ├─ Read agent.yaml manifest                                   │  ┃
+┃  │   ├─ Parse three-surface config:                                │  ┃
+┃  │   │    • REST API (port 63000)                                  │  ┃
+┃  │   │    • A2A gRPC (port 60000)                                  │  ┃
+┃  │   │    • UI Web (port 65000)                                    │  ┃
+┃  │   │                                                              │  ┃
+┃  │   └─ Start servers on allocated ports                           │  ┃
+┃  │                                                                  │  ┃
+┃  │ Agent is now RUNNING and ready to receive requests!             │  ┃
+┃  └─────────────────────────────────────────────────────────────────┘  ┃
+┃                                                                         ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ AGENT STATUS: HEALTHY                                           │  ┃
+┃  │                                                                  │  ┃
+┃  │ ✓ REST API:  listening on 0.0.0.0:63000                        │  ┃
+┃  │ ✓ A2A gRPC:  listening on 0.0.0.0:60000                        │  ┃
+┃  │ ✓ UI Web:    listening on 0.0.0.0:65000                        │  ┃
+┃  │                                                                  │  ┃
+┃  │ Log: /var/lib/pixell/logs/agent_4906eeb7.log                    │  ┃
+┃  └─────────────────────────────────────────────────────────────────┘  ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+===============================================================================
+DEPLOYMENT COMPLETE
+===============================================================================
+
+Key Points:
+1. Linux User Isolation: Each agent runs as dedicated system user (agent_xxx)
+2. Package Caching: Downloads and extractions cached by SHA256 hash
+3. Virtual Environment Reuse: Venvs reused when requirements match
+4. Fast Dependency Installation: Prefers 'uv' (10-100x faster than pip)
+5. Security: Zip-slip protection, size limits, checksum validation
+6. Port Allocation: PAC provides ports (production) or allocated internally
+
+File References:
+- Deployment: src/pixell_runtime/supervisor/state.py:383-667
+- User Management: src/pixell_runtime/supervisor/user_manager.py:97-207
+- Package Download: src/pixell_runtime/supervisor/package_downloader.py
+- Process Management: src/pixell_runtime/supervisor/process_manager.py:41-171
+- Agent Runtime: src/pixell_runtime/agents/loader.py:666-839

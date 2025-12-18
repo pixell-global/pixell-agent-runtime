@@ -1,0 +1,80 @@
+================================================================================
+PIXELL AGENT RUNTIME - A2A REQUEST FLOW (SIMPLIFIED)
+================================================================================
+
+┌──────────────┐
+│   CLIENT     │  gRPC/JSON-RPC 2.0
+│  (External)  │  POST /agents/4906eeb7/a2a/pixell.agent.AgentService/Invoke
+└──────┬───────┘
+       │ HTTPS (port 443)
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  AWS ALB (par.pixell.global)                                            │
+│  ─────────────────────────────────────────────────────────────────────  │
+│  • TLS Termination (*.pixell.global cert)                               │
+│  • Path routing: /agents/{id}/a2a/* → pac-agent-{id}-grpc target group │
+│  • Forward to EC2 on port 60000 (HTTP/2)                                │
+└─────────────────────────────┬───────────────────────────────────────────┘
+                              │
+                              ▼
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  EC2 Instance               ┃
+┃  ─────────────────────────────────────────────────────────────────── ┃
+┃                                                                        ┃
+┃  ┌──────────────────────────────────────────────────────────────┐    ┃
+┃  │ GrpcGateway (Port 60000)                                     │    ┃
+┃  │ supervisor/grpc_gateway.py                                   │    ┃
+┃  │                                                              │    ┃
+┃  │ 1. Parse path: /agents/4906eeb7/a2a/pixell...               │    ┃
+┃  │    Extract agent_id = "4906eeb7"                            │    ┃
+┃  │                                                              │    ┃
+┃  │ 2. Lookup agent in SupervisorState                          │    ┃
+┃  │    Get agent.ports.a2a = 60000                              │    ┃
+┃  │                                                              │    ┃
+┃  │ 3. Forward to localhost:60000                               │    ┃
+┃  └────────────────────────┬─────────────────────────────────────┘    ┃
+┃                           │                                           ┃
+┃                           ▼                                           ┃
+┃  ┌──────────────────────────────────────────────────────────────┐    ┃
+┃  │ Agent A2A Server                         │    ┃
+┃  │ a2a/server.py                                                │    ┃
+┃  │                                                              │    ┃
+┃  │ PARRoutingInterceptor:                                       │    ┃
+┃  │   Strip prefix: /agents/4906eeb7/a2a/pixell...              │    ┃
+┃  │   Result: /pixell.agent.AgentService/Invoke                 │    ┃
+┃  │                                                              │    ┃
+┃  │ AgentServiceImpl.Invoke():                                   │    ┃
+┃  │   Parse JSON-RPC 2.0: skill="chat", params={...}            │    ┃
+┃  │   Route to handler (custom/subprocess/default)              │    ┃
+┃  │                                                              │    ┃
+┃  │ Agent Handler:                                               │    ┃
+┃  │   Process request → Generate response                        │    ┃
+┃  │                                                              │    ┃
+┃  │ Build ActionResult:                                          │    ┃
+┃  │   {success: true, result: "...", duration_ms: 142}          │    ┃
+┃  └────────────────────────┬─────────────────────────────────────┘    ┃
+                            │
+                            ▼
+       Response flows back through GrpcGateway → ALB → Client
+                     Total time: ~150ms
+
+================================================================================
+KEY COMPONENTS
+================================================================================
+
+Component               Port    Purpose
+─────────────────────────────────────────────────────────────────────────────
+ALB                     443     TLS termination, path-based routing
+GrpcGateway            60000    Path parsing, agent lookup, forwarding
+Agent A2A Servers   60000-60199 Individual agent gRPC servers (200 capacity)
+Agent REST APIs     63000-63199 Individual agent HTTP APIs
+Agent UIs           65000-65199 Individual agent web interfaces
+
+Path Pattern: /agents/{agent_id}/a2a/{service}/{method}
+Example:      /agents/4906eeb7/a2a/pixell.agent.AgentService/Invoke
+
+Protocol: gRPC with JSON-RPC 2.0 format
+Security: TLS at ALB, Linux user isolation per agent
+
+================================================================================

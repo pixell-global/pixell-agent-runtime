@@ -4,12 +4,15 @@ import asyncio
 import os
 import subprocess
 import signal
+import sys
 import time
+import threading
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, IO, Any
 import structlog
 
-from pixell_runtime.supervisor.models import AgentProcess, AgentStatus, Ports
+from pixell_runtime.supervisor.models import AgentProcess, AgentStatus, Ports, SocketPathsModel
+from pixell_runtime.supervisor.socket_allocator import SocketPaths
 
 logger = structlog.get_logger()
 
@@ -32,28 +35,56 @@ class ProcessManager:
         """
         self.graceful_shutdown_timeout_sec = graceful_shutdown_timeout_sec
         self.processes: Dict[str, subprocess.Popen] = {}  # agent_app_id -> Popen
-        self.log_files: Dict[str, 'IO[str]'] = {}  # agent_app_id -> log file handle
+        self.log_files: Dict[str, IO] = {}  # agent_app_id -> log file handle
+        self._log_threads: Dict[str, list] = {}
         logger.info(
             "ProcessManager initialized",
             graceful_shutdown_timeout_sec=graceful_shutdown_timeout_sec,
         )
+
+    def _signal_process_group(self, process: subprocess.Popen, sig: int) -> bool:
+        """Send signal to process group rooted at process pid."""
+        try:
+            os.killpg(process.pid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except Exception as e:
+            logger.warning(
+                "Failed to signal process group",
+                pid=process.pid,
+                signal=sig,
+                error=str(e),
+            )
+            return False
 
     def spawn_agent(
         self,
         agent_app_id: str,
         linux_user: str,
         package_path: Path,
-        ports: Ports,
+        ports: Optional[Ports] = None,
+        socket_paths: Optional[SocketPaths] = None,
+        socket_mode: bool = False,
+        venv_path: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         package_env: Optional[Dict[str, str]] = None,
     ) -> int:
         """Spawn an agent process as a specific Linux user.
 
+        IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+        DEPRECATED: socket_mode=False (TCP ports) is deprecated and should NEVER be activated.
+        Port mode has hard capacity limits (200 agents max) and is being phased out.
+        All new deployments MUST use socket_mode=True.
+
         Args:
             agent_app_id: Agent identifier
             linux_user: Linux username to run as
-            package_path: Path to agent package (APKG)
-            ports: Ports allocation for the agent
+            package_path: Path to extracted agent package directory
+            ports: DEPRECATED - Port allocation (required if socket_mode=False). DO NOT USE.
+            socket_paths: Socket paths for the agent (required for socket_mode=True - the only supported mode)
+            socket_mode: MUST be True. socket_mode=False is DEPRECATED and should never be used.
+            venv_path: Virtual environment path (optional)
             env: Additional environment variables from DeployRequest (highest priority)
             package_env: Environment variables from agent.yaml + deploy.json (medium priority)
 
@@ -62,14 +93,41 @@ class ProcessManager:
 
         Raises:
             RuntimeError: If process spawn fails
+            ValueError: If socket_mode and ports/socket_paths are inconsistent
         """
-        logger.info(
-            "Spawning agent process",
-            agent_app_id=agent_app_id,
-            user=linux_user,
-            package=str(package_path),
-            ports={"rest": ports.rest, "a2a": ports.a2a, "ui": ports.ui},
-        )
+        # Validate inputs
+        if socket_mode:
+            if socket_paths is None:
+                raise ValueError("socket_mode=True requires socket_paths")
+            if ports is not None:
+                raise ValueError("socket_mode=True but ports provided")
+            logger.info(
+                "Spawning agent process (socket mode)",
+                agent_app_id=agent_app_id,
+                user=linux_user,
+                package=str(package_path),
+                sockets={
+                    "rest": str(socket_paths.rest),
+                    "a2a": str(socket_paths.a2a),
+                    "ui": str(socket_paths.ui),
+                },
+            )
+        else:
+            # DEPRECATED: Port mode (socket_mode=False) should never be used.
+            # This branch exists only for backwards compatibility.
+            # TODO: Remove port mode support once all agents use socket mode.
+            if ports is None:
+                raise ValueError("socket_mode=False requires ports")
+            if socket_paths is not None:
+                raise ValueError("socket_mode=False but socket_paths provided")
+            logger.warning(
+                "Spawning agent process (port mode - DEPRECATED)",
+                agent_app_id=agent_app_id,
+                user=linux_user,
+                package=str(package_path),
+                ports={"rest": ports.rest, "a2a": ports.a2a, "ui": ports.ui},
+                deprecation_note="Port mode should not be used. Migrate to socket_mode=True."
+            )
 
         # Determine home directory for agent user
         # Format: /home/agent_xxx where xxx matches linux_user suffix
@@ -83,14 +141,82 @@ class ProcessManager:
             "AGENT_PACKAGE_PATH": str(package_path),
             # NOTE: PACKAGE_URL not set - runtime will use AGENT_PACKAGE_PATH instead
             # Runtime validation rejects file:// URLs, and AGENT_PACKAGE_PATH is preferred
-            "REST_PORT": str(ports.rest),
-            "A2A_PORT": str(ports.a2a),
-            "UI_PORT": str(ports.ui),
             "BASE_PATH": f"/agents/{agent_app_id}",
             "MULTIPLEXED": "true",
             "PYTHONUNBUFFERED": "1",  # Ensure logs are not buffered
             "HOME": home_dir,  # Set HOME for agent user (UV/pip need this for cache)
         }
+
+        # Set socket or port environment variables based on mode
+        # IMPORTANT: socket_mode=True is the ONLY supported mode.
+        # DEPRECATED: socket_mode=False (ports) should never be activated.
+        if socket_mode:
+            # PREFERRED: Unix domain socket mode
+            process_env["SOCKET_MODE"] = "true"
+            process_env["REST_SOCKET"] = str(socket_paths.rest)
+            process_env["A2A_SOCKET"] = str(socket_paths.a2a)
+            process_env["UI_SOCKET"] = str(socket_paths.ui)
+        else:
+            # DEPRECATED: Port mode - DO NOT USE
+            # TODO: Remove this branch once all agents use socket mode.
+            process_env["SOCKET_MODE"] = "false"
+            process_env["REST_PORT"] = str(ports.rest)
+            process_env["A2A_PORT"] = str(ports.a2a)
+            process_env["UI_PORT"] = str(ports.ui)
+        
+        # Add virtual environment path if available
+        if venv_path:
+            process_env["AGENT_VENV_PATH"] = venv_path
+        
+        # Forward logging-related environment variables from supervisor to agent
+        log_dir = os.getenv("LOG_DIR")
+        if log_dir:
+            process_env["LOG_DIR"] = log_dir
+        log_level = os.getenv("LOG_LEVEL")
+        if log_level:
+            process_env["LOG_LEVEL"] = log_level
+        log_format = os.getenv("LOG_FORMAT")
+        if log_format:
+            process_env["LOG_FORMAT"] = log_format
+
+        # Ensure log directory exists and has proper permissions before spawning
+        # This ensures agent process can write logs even if it crashes early
+        log_file_path = None
+        if log_dir:
+            try:
+                log_dir_path = Path(log_dir)
+                log_dir_path.mkdir(parents=True, exist_ok=True)
+                # Set permissions to allow all users to write (0o1777 = sticky bit + rwx for all)
+                try:
+                    log_dir_path.chmod(0o1777)
+                except Exception:
+                    # If we can't set 1777, try 777
+                    try:
+                        log_dir_path.chmod(0o777)
+                    except Exception:
+                        pass  # Continue even if permission setting fails
+                
+                # Pre-create log file with proper permissions
+                log_file_path = log_dir_path / f"agent_{agent_app_id}.log"
+                try:
+                    # Touch the file to create it if it doesn't exist
+                    log_file_path.touch(exist_ok=True)
+                    # Set permissions so agent user can write
+                    log_file_path.chmod(0o666)
+                except Exception as e:
+                    logger.warning(
+                        "Could not pre-create log file",
+                        agent_app_id=agent_app_id,
+                        log_file=str(log_file_path),
+                        error=str(e),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Could not ensure log directory permissions",
+                    agent_app_id=agent_app_id,
+                    log_dir=log_dir,
+                    error=str(e),
+                )
 
         # Add environment variables from agent.yaml + deploy.json (medium priority)
         if package_env:
@@ -151,6 +277,9 @@ class ProcessManager:
 
             # Store process reference
             self.processes[agent_app_id] = process
+            
+            # Store log file handle so it can be closed when process stops
+            self.log_files[agent_app_id] = log_handle
 
             logger.info(
                 "Agent process spawned",
@@ -492,7 +621,8 @@ class ProcessManager:
             if force:
                 # Force kill
                 logger.info("Force killing agent process", agent_app_id=agent_app_id, pid=pid)
-                process.kill()
+                if not self._signal_process_group(process, signal.SIGKILL):
+                    process.kill()
                 process.wait(timeout=5)
             else:
                 # Graceful shutdown
@@ -502,7 +632,8 @@ class ProcessManager:
                     pid=pid,
                     timeout=timeout,
                 )
-                process.terminate()
+                if not self._signal_process_group(process, signal.SIGTERM):
+                    process.terminate()
 
                 # Wait for graceful shutdown
                 try:
@@ -515,9 +646,22 @@ class ProcessManager:
                         agent_app_id=agent_app_id,
                         pid=pid,
                     )
-                    process.kill()
+                    if not self._signal_process_group(process, signal.SIGKILL):
+                        process.kill()
                     process.wait(timeout=5)
 
+            # Clean up log forwarding threads
+            if agent_app_id in self._log_threads:
+                del self._log_threads[agent_app_id]
+            
+            # Close log file handle if it was opened
+            if agent_app_id in self.log_files:
+                try:
+                    self.log_files[agent_app_id].close()
+                except Exception:
+                    pass
+                del self.log_files[agent_app_id]
+            
             # Clean up
             # Close log file if open
             if agent_app_id in self.log_files:
@@ -539,14 +683,26 @@ class ProcessManager:
             )
             raise RuntimeError(f"Failed to stop agent {agent_app_id}: {e}") from e
 
-    async def health_check(self, agent_app_id: str, ports: Ports) -> bool:
+    async def health_check(
+        self,
+        agent_app_id: str,
+        ports: Optional[Ports] = None,
+        socket_paths: Optional[SocketPaths] = None,
+        socket_mode: bool = False,
+    ) -> bool:
         """Perform health check on agent.
 
         Checks if agent's REST API responds to health endpoint.
 
+        IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+        DEPRECATED: socket_mode=False (TCP ports) is deprecated and should NEVER be activated.
+        Port mode has hard capacity limits (200 agents max) and is being phased out.
+
         Args:
             agent_app_id: Agent identifier
-            ports: Ports allocation for the agent
+            ports: DEPRECATED - Port allocation (required if socket_mode=False). DO NOT USE.
+            socket_paths: Socket paths for the agent (required for socket_mode=True - the only supported mode)
+            socket_mode: MUST be True. socket_mode=False is DEPRECATED and should never be used.
 
         Returns:
             True if healthy, False otherwise
@@ -560,28 +716,69 @@ class ProcessManager:
             # Check REST health endpoint
             import httpx
 
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                url = f"http://localhost:{ports.rest}/agents/{agent_app_id}/health"
-                response = await client.get(url)
+            if socket_mode:
+                if socket_paths is None:
+                    logger.error("socket_mode=True but socket_paths not provided")
+                    return False
+                # Use Unix socket transport
+                transport = httpx.AsyncHTTPTransport(uds=str(socket_paths.rest))
+                async with httpx.AsyncClient(transport=transport, timeout=2.0) as client:
+                    # For UDS, the URL host doesn't matter, but path does
+                    url = f"http://localhost/agents/{agent_app_id}/health"
+                    response = await client.get(url)
+            else:
+                if ports is None:
+                    logger.error("socket_mode=False but ports not provided")
+                    return False
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    url = f"http://localhost:{ports.rest}/agents/{agent_app_id}/health"
+                    response = await client.get(url)
 
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("status") == "healthy":
-                        logger.debug("Agent health check passed", agent_app_id=agent_app_id)
-                        return True
+            # Log response details (common to both socket and port modes)
+            try:
+                response_data = response.json()
+            except Exception:
+                response_data = {"raw_text": response.text[:200]}  # Truncate if too long
 
-                logger.debug(
-                    "Agent health check failed",
-                    agent_app_id=agent_app_id,
-                    status_code=response.status_code,
-                )
-                return False
+            if response.status_code == 200:
+                status_ok = False
+                if response_data.get("status") == "healthy":
+                    status_ok = True
+                elif isinstance(response_data.get("ok"), bool):
+                    status_ok = response_data.get("ok") is True
+
+                if status_ok:
+                    logger.info(
+                        "Agent health check passed",
+                        agent_app_id=agent_app_id,
+                        response=response_data,
+                    )
+                    return True
+                else:
+                    # 200 OK but status is not "healthy"
+                    logger.warning(
+                        "Agent health check returned 200 but status is not healthy",
+                        agent_app_id=agent_app_id,
+                        status_code=response.status_code,
+                        response=response_data,
+                    )
+                    return False
+
+            # Non-200 status code
+            logger.warning(
+                "Agent health check failed",
+                agent_app_id=agent_app_id,
+                status_code=response.status_code,
+                response=response_data,
+            )
+            return False
 
         except Exception as e:
-            logger.debug(
+            logger.warning(
                 "Agent health check exception",
                 agent_app_id=agent_app_id,
                 error=str(e),
+                exc_info=True,
             )
             return False
 
@@ -633,6 +830,77 @@ class ProcessManager:
 
         logger.info("Stopped all agent processes", stopped_count=count)
         return count
+
+    def _start_log_forwarding(
+        self,
+        agent_app_id: str,
+        process: subprocess.Popen,
+        log_file_path: Path,
+        stdout_target,
+        stderr_target,
+    ) -> None:
+        """Start background threads to forward process stdout to log file.
+        
+        Note: stderr is already redirected to log file if stderr_target is a file object.
+        
+        Args:
+            agent_app_id: Agent identifier
+            process: Subprocess process object
+            log_file_path: Path to log file
+            stdout_target: stdout target (PIPE or file)
+            stderr_target: stderr target (PIPE or file, ignored if file object)
+        """
+        threads = []
+        
+        def forward_stream(stream, stream_name: str):
+            """Forward stream to log file."""
+            try:
+                with open(log_file_path, "a", buffering=1) as log_file:
+                    for line in iter(stream.readline, ""):
+                        if not line:
+                            break
+                        # Write with prefix to distinguish from structured logs
+                        log_file.write(f"[{stream_name}] {line}")
+                        log_file.flush()
+            except Exception as e:
+                logger.warning(
+                    "Error forwarding stream to log file",
+                    agent_app_id=agent_app_id,
+                    stream=stream_name,
+                    error=str(e),
+                )
+            finally:
+                stream.close()
+        
+        # Start thread for stdout if using PIPE
+        # stderr is already redirected to log file if stderr_target is a file object
+        if stdout_target == subprocess.PIPE and process.stdout:
+            stdout_thread = threading.Thread(
+                target=forward_stream,
+                args=(process.stdout, "stdout"),
+                daemon=True,
+            )
+            stdout_thread.start()
+            threads.append(stdout_thread)
+        
+        # Start thread for stderr only if using PIPE (not if already redirected to file)
+        if stderr_target == subprocess.PIPE and process.stderr:
+            stderr_thread = threading.Thread(
+                target=forward_stream,
+                args=(process.stderr, "stderr"),
+                daemon=True,
+            )
+            stderr_thread.start()
+            threads.append(stderr_thread)
+        
+        if threads:
+            self._log_threads[agent_app_id] = threads
+            logger.debug(
+                "Started log forwarding threads",
+                agent_app_id=agent_app_id,
+                log_file=str(log_file_path),
+                threads=len(threads),
+            )
 
     def cleanup(self):
         """Clean up process manager resources."""

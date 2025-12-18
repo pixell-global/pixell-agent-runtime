@@ -1,9 +1,9 @@
 """Pydantic models for supervisor API and internal state."""
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from datetime import datetime
 from enum import Enum
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AgentStatus(str, Enum):
@@ -18,7 +18,13 @@ class AgentStatus(str, Enum):
 
 
 class Ports(BaseModel):
-    """Port allocation for an agent.
+    """DEPRECATED: Port allocation for an agent.
+
+    WARNING: Port mode (socket_mode=False) is DEPRECATED and should NEVER be activated.
+    All agents MUST use Unix domain sockets (socket_mode=True) instead.
+    Port mode has a hard capacity limit of 200 agents per instance and is being phased out.
+    This class exists only for backwards compatibility during migration.
+    TODO: Remove this class once all agents are migrated to socket mode.
 
     PAC allocates ports in these ranges (per instance, 200-agent capacity):
     - A2A (gRPC):  60000-60199 (slot_number + 60000)
@@ -27,9 +33,27 @@ class Ports(BaseModel):
 
     Note: Port constraints removed - PAC manages port ranges.
     """
-    rest: int = Field(..., ge=1024, le=65535, description="REST API port")
-    a2a: int = Field(..., ge=1024, le=65535, description="gRPC A2A port")
-    ui: int = Field(..., ge=1024, le=65535, description="UI server port")
+    rest: int = Field(..., ge=1024, le=65535, description="DEPRECATED: REST API port")
+    a2a: int = Field(..., ge=1024, le=65535, description="DEPRECATED: gRPC A2A port")
+    ui: int = Field(..., ge=1024, le=65535, description="DEPRECATED: UI server port")
+
+
+class SocketPathsModel(BaseModel):
+    """Unix domain socket paths for an agent (Pydantic model for API).
+
+    Used when socket_mode=True instead of Ports.
+    Socket architecture provides unlimited agent capacity.
+
+    Directory structure:
+        /var/run/pixell-agents/agent_{short_id}/
+        ├── rest.sock  (REST API)
+        ├── a2a.sock   (gRPC A2A)
+        └── ui.sock    (UI server)
+    """
+    base_dir: str = Field(..., description="Base directory for agent sockets")
+    rest: str = Field(..., description="REST API socket path")
+    a2a: str = Field(..., description="gRPC A2A socket path")
+    ui: str = Field(..., description="UI server socket path")
 
 
 class DeployRequest(BaseModel):
@@ -47,17 +71,39 @@ class DeployRequest(BaseModel):
     org_short_id: Optional[str] = Field(None, description="Organization short ID (16 chars, e.g., 'x8f2k9m4n7p1q3r5')")
     agent_short_id: Optional[str] = Field(None, description="Agent short ID (8 chars, e.g., 'a7b2c9d4')")
 
-    # Port allocation from PAC (database-backed)
-    # If provided, PAR uses these ports. If null, PAR falls back to internal allocation.
-    # PAC sends: {"rest": 63001, "a2a": 60001, "ui": 65001}
+    # Socket mode flag - when True, use Unix domain sockets instead of TCP ports
+    # IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+    # DEPRECATED: socket_mode=False (TCP ports) is deprecated and should NEVER be activated.
+    # Port mode has a hard capacity limit of 200 agents per instance and is being phased out.
+    # All new deployments MUST use socket_mode=True.
+    socket_mode: bool = Field(
+        True,
+        description="MUST be True. Use Unix domain sockets instead of TCP ports. "
+                    "socket_mode=False (ports) is DEPRECATED and should never be used."
+    )
+
+    # DEPRECATED: Port allocation from PAC (database-backed) - used when socket_mode=False
+    # WARNING: Port mode is deprecated and should never be activated.
+    # This field exists only for backwards compatibility during migration.
+    # All agents should use socket_mode=True with Unix sockets instead.
+    # TODO: Remove this field once all agents are migrated to socket mode.
     ports: Optional[Ports] = Field(
         None,
-        description="Port allocation from PAC. If provided, PAR uses these ports. "
-                    "If null, PAR falls back to internal allocation (backward compat)."
+        description="DEPRECATED: Port allocation from PAC. Use socket_mode=True instead."
     )
 
     # Idempotency control
     allow_update: bool = Field(True, description="If true, update agent if already exists with different deployment_id")
+
+    @model_validator(mode='after')
+    def validate_socket_mode_ports(self) -> 'DeployRequest':
+        """Validate socket_mode and ports are consistent."""
+        if self.socket_mode and self.ports is not None:
+            raise ValueError(
+                "socket_mode=True requires ports=None. "
+                "Cannot specify both socket_mode and ports."
+            )
+        return self
 
     # Optional configuration
     max_package_size_mb: int = Field(100, description="Maximum package size in MB")
@@ -101,12 +147,29 @@ class AgentProcess(BaseModel):
     agent_app_id: str
     deployment_id: str
     status: AgentStatus
-    ports: Ports
+
+    # Socket mode flag - mirrors DeployRequest.socket_mode
+    # IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+    # DEPRECATED: socket_mode=False (TCP ports) is deprecated and should NEVER be activated.
+    socket_mode: bool = Field(False, description="Should always be True. socket_mode=False is DEPRECATED.")
+
+    # DEPRECATED: Port allocation (used when socket_mode=False)
+    # WARNING: Port mode is deprecated and should never be activated.
+    # TODO: Remove this field once all agents are migrated to socket mode.
+    ports: Optional[Ports] = Field(None, description="DEPRECATED: Port allocation (None when socket_mode=True)")
+
+    # Socket paths (used when socket_mode=True) - THIS IS THE PREFERRED MODE
+    socket_paths: Optional[SocketPathsModel] = Field(
+        None,
+        description="Socket paths - required for socket_mode=True (the only supported mode)"
+    )
+
     pid: Optional[int] = None
     linux_user: str
     package_path: str
     package_url: str
     package_sha256: Optional[str] = None
+    venv_path: Optional[str] = Field(None, description="Virtual environment path for agent")
 
     # Timestamps
     created_at: datetime
@@ -121,6 +184,21 @@ class AgentProcess(BaseModel):
     # Configuration
     config: Dict[str, Any] = Field(default_factory=dict, description="Agent configuration")
 
+    @model_validator(mode='after')
+    def validate_ports_or_sockets(self) -> 'AgentProcess':
+        """Validate that agent has either ports or socket_paths based on socket_mode."""
+        if self.socket_mode:
+            if self.ports is not None:
+                raise ValueError("socket_mode=True but ports is set")
+            if self.socket_paths is None:
+                raise ValueError("socket_mode=True requires socket_paths")
+        else:
+            if self.socket_paths is not None:
+                raise ValueError("socket_mode=False but socket_paths is set")
+            if self.ports is None:
+                raise ValueError("socket_mode=False requires ports")
+        return self
+
     class Config:
         json_encoders = {
             datetime: lambda v: v.isoformat()
@@ -132,7 +210,11 @@ class DeployResponse(BaseModel):
     agent_app_id: str
     deployment_id: str
     status: str  # String value of AgentStatus enum
-    ports: Ports
+    # IMPORTANT: socket_mode=True should always be used. Port mode is DEPRECATED.
+    socket_mode: bool = Field(False, description="Should always be True. socket_mode=False is DEPRECATED.")
+    # DEPRECATED: ports field - port mode should never be activated
+    ports: Optional[Ports] = Field(None, description="DEPRECATED: Port allocation (None when socket_mode=True)")
+    socket_paths: Optional[SocketPathsModel] = Field(None, description="Socket paths (required for socket_mode=True)")
     linux_user: str
     pid: Optional[int] = None
     message: str
@@ -152,8 +234,12 @@ class AgentStatusResponse(BaseModel):
     uptime_seconds: int = 0
     memory_mb: float = 0.0
     cpu_percent: float = 0.0
-    ports: Ports
-    health: Dict[str, bool] = Field(default_factory=dict, description="Health status per port type")
+    # IMPORTANT: socket_mode=True should always be used. Port mode is DEPRECATED.
+    socket_mode: bool = Field(False, description="Should always be True. socket_mode=False is DEPRECATED.")
+    # DEPRECATED: ports field - port mode should never be activated
+    ports: Optional[Ports] = Field(None, description="DEPRECATED: Port allocation (None when socket_mode=True)")
+    socket_paths: Optional[SocketPathsModel] = Field(None, description="Socket paths (required for socket_mode=True)")
+    health: Dict[str, bool] = Field(default_factory=dict, description="Health status per service type")
 
     class Config:
         json_encoders = {

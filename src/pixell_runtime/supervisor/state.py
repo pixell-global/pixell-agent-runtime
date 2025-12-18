@@ -1,13 +1,18 @@
 """Supervisor state management for agent deployments."""
 
 import asyncio
+import shutil
+import subprocess
+import zipfile
 import json
 import os
+import re
 import yaml
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Union
 import structlog
+from dotenv import dotenv_values
 
 from pixell_runtime.supervisor.models import (
     AgentProcess,
@@ -16,16 +21,21 @@ from pixell_runtime.supervisor.models import (
     UpdateRequest,
     DeleteRequest,
     Ports,
+    SocketPathsModel,
 )
 from pixell_runtime.supervisor.user_manager import LinuxUserManager
 from pixell_runtime.supervisor.port_allocator import PortAllocator
+from pixell_runtime.supervisor.socket_allocator import SocketAllocator
 from pixell_runtime.supervisor.package_downloader import PackageDownloader
 from pixell_runtime.supervisor.process_manager import ProcessManager
+from pixell_runtime.agents.loader import PackageLoader
 
 logger = structlog.get_logger()
 
 
 class SupervisorState:
+    _PLACEHOLDER_PATTERN = re.compile(r"\$\{([^}]+)\}")
+
     """Manages supervisor state and orchestrates agent lifecycle.
 
     Responsibilities:
@@ -39,6 +49,7 @@ class SupervisorState:
         self,
         user_manager: Optional[LinuxUserManager] = None,
         port_allocator: Optional[PortAllocator] = None,
+        socket_allocator: Optional[SocketAllocator] = None,
         package_downloader: Optional[PackageDownloader] = None,
         process_manager: Optional[ProcessManager] = None,
     ):
@@ -47,13 +58,20 @@ class SupervisorState:
         Args:
             user_manager: LinuxUserManager instance (default: creates new)
             port_allocator: PortAllocator instance (default: creates new)
+            socket_allocator: SocketAllocator instance (default: creates new)
             package_downloader: PackageDownloader instance (default: creates new)
             process_manager: ProcessManager instance (default: creates new)
         """
         self.user_manager = user_manager or LinuxUserManager()
         self.port_allocator = port_allocator or PortAllocator()
+        self.socket_allocator = socket_allocator or SocketAllocator()
         self.package_downloader = package_downloader or PackageDownloader()
         self.process_manager = process_manager or ProcessManager()
+
+        # Setup package extract directory
+        extract_dir = Path(os.getenv("PACKAGE_EXTRACT_DIR", "/var/lib/pixell/extracted"))
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        self.extract_dir = extract_dir
 
         # Track agent processes: agent_app_id -> AgentProcess
         self.agents: Dict[str, AgentProcess] = {}
@@ -89,7 +107,9 @@ class SupervisorState:
         """
         import subprocess
 
-        packages_extract_dir = Path("/tmp/pixell_packages")
+        # Use environment variable for package extract dir, default to /tmp/pixell_packages
+        # This allows configuration in diverse environments (EC2, Docker, Local)
+        packages_extract_dir = Path(os.getenv("PACKAGES_EXTRACT_DIR", "/tmp/pixell_packages"))
 
         try:
             # Create directory if it doesn't exist
@@ -97,28 +117,35 @@ class SupervisorState:
 
             # Set permissions to 1777 (drwxrwxrwt) - world-writable with sticky bit
             # Sticky bit ensures users can only delete their own directories
-            subprocess.run(
-                ["chmod", "1777", str(packages_extract_dir)],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=5
-            )
+            try:
+                subprocess.run(
+                    ["chmod", "1777", str(packages_extract_dir)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=5
+                )
+                logger.info(
+                    "Initialized shared package extraction directory",
+                    path=str(packages_extract_dir),
+                    permissions="1777 (drwxrwxrwt)",
+                    note="All agent users can create subdirectories for package extraction"
+                )
+            except FileNotFoundError:
+                # chmod might not be available on Windows or restricted environments
+                logger.warning(
+                    "chmod command not found, skipping permission setting",
+                    path=str(packages_extract_dir),
+                    note="Ensure directory has correct permissions manually if needed"
+                )
+            except subprocess.CalledProcessError as e:
+                logger.warning(
+                    "Failed to set permissions on package extraction directory (chmod failed)",
+                    path=str(packages_extract_dir),
+                    error=e.stderr,
+                    note="Agents may fail to extract packages if permissions are too restrictive"
+                )
 
-            logger.info(
-                "Initialized shared package extraction directory",
-                path=str(packages_extract_dir),
-                permissions="1777 (drwxrwxrwt)",
-                note="All agent users can create subdirectories for package extraction"
-            )
-
-        except subprocess.CalledProcessError as e:
-            logger.error(
-                "Failed to set permissions on package extraction directory",
-                path=str(packages_extract_dir),
-                error=e.stderr,
-                note="Agents may fail to extract packages"
-            )
         except Exception as e:
             logger.error(
                 "Failed to initialize package extraction directory",
@@ -126,6 +153,15 @@ class SupervisorState:
                 error=str(e),
                 note="Agents may fail to extract packages"
             )
+
+    def _sanitize_dir_name(self, value: str, fallback: str) -> str:
+        """Convert arbitrary identifier into filesystem-safe directory name."""
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", value or "")
+        safe = safe.strip("_")
+        if not safe:
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", fallback or "")
+            safe = safe.strip("_")
+        return safe or "package"
 
     def start_background_tasks(self) -> None:
         """Start background tasks (zombie reaper, etc.).
@@ -152,51 +188,170 @@ class SupervisorState:
         if isinstance(package_path, str):
             package_path = Path(package_path)
 
-        agent_env = {}
-        deploy_env = {}
+        file_env = self._load_env_file(package_path)
+        agent_env = self._load_agent_yaml_env(package_path)
+        deploy_env = self._load_deploy_json_env(package_path)
 
-        # Read agent.yaml
+        # Merge precedence: .env < agent.yaml < deploy.json
+        merged_env = {**file_env, **agent_env, **deploy_env}
+
+        if not merged_env:
+            return merged_env
+
+        resolved_env = self._resolve_env_placeholders(
+            merged_env,
+            extra_sources={**file_env, **os.environ}
+        )
+
+        logger.debug(
+            "Resolved package environment variables",
+            path=str(package_path),
+            env_count=len(resolved_env)
+        )
+
+        return resolved_env
+
+    def _load_env_file(self, package_path: Path) -> Dict[str, str]:
+        """Load environment variables from .env file if present."""
+        env_path = package_path / ".env"
+        if not env_path.exists():
+            return {}
+
+        try:
+            values = {
+                key: value
+                for key, value in (dotenv_values(env_path) or {}).items()
+                if value is not None
+            }
+            logger.debug(
+                "Loaded environment from .env file",
+                path=str(env_path),
+                env_count=len(values)
+            )
+            return values
+        except Exception as e:
+            logger.warning(
+                "Failed to load environment from .env file",
+                path=str(env_path),
+                error=str(e)
+            )
+            return {}
+
+    def _load_agent_yaml_env(self, package_path: Path) -> Dict[str, str]:
+        """Load environment section from agent.yaml."""
         agent_yaml_path = package_path / "agent.yaml"
-        if agent_yaml_path.exists():
-            try:
-                with open(agent_yaml_path) as f:
-                    agent_data = yaml.safe_load(f)
-                    agent_env = agent_data.get("environment", {})
-                    logger.debug(
-                        "Loaded environment from agent.yaml",
-                        path=str(agent_yaml_path),
-                        env_count=len(agent_env)
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Failed to load environment from agent.yaml",
+        if not agent_yaml_path.exists():
+            return {}
+
+        try:
+            with open(agent_yaml_path) as f:
+                agent_data = yaml.safe_load(f) or {}
+                env_data = agent_data.get("environment", {}) or {}
+                logger.debug(
+                    "Loaded environment from agent.yaml",
                     path=str(agent_yaml_path),
-                    error=str(e)
+                    env_count=len(env_data)
                 )
+                return env_data
+        except Exception as e:
+            logger.warning(
+                "Failed to load environment from agent.yaml",
+                path=str(agent_yaml_path),
+                error=str(e)
+            )
+            return {}
 
-        # Read deploy.json
+    def _load_deploy_json_env(self, package_path: Path) -> Dict[str, str]:
+        """Load environment section from deploy.json."""
         deploy_json_path = package_path / "deploy.json"
-        if deploy_json_path.exists():
-            try:
-                with open(deploy_json_path) as f:
-                    deploy_data = json.load(f)
-                    deploy_env = deploy_data.get("environment", {})
-                    logger.debug(
-                        "Loaded environment from deploy.json",
-                        path=str(deploy_json_path),
-                        env_count=len(deploy_env)
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Failed to load environment from deploy.json",
+        if not deploy_json_path.exists():
+            return {}
+
+        try:
+            with open(deploy_json_path) as f:
+                deploy_data = json.load(f) or {}
+                env_data = deploy_data.get("environment", {}) or {}
+                logger.debug(
+                    "Loaded environment from deploy.json",
                     path=str(deploy_json_path),
-                    error=str(e)
+                    env_count=len(env_data)
                 )
+                return env_data
+        except Exception as e:
+            logger.warning(
+                "Failed to load environment from deploy.json",
+                path=str(deploy_json_path),
+                error=str(e)
+            )
+            return {}
 
-        # Merge: agent.yaml < deploy.json (deploy.json takes precedence)
-        merged_env = {**agent_env, **deploy_env}
+    def _resolve_env_placeholders(
+        self,
+        env_values: Dict[str, str],
+        extra_sources: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """Resolve ${VAR} placeholders using provided sources.
 
-        return merged_env
+        Args:
+            env_values: Environment variables to resolve.
+            extra_sources: Additional lookup sources (e.g., .env file, os.environ).
+        """
+        extra_sources = extra_sources or {}
+        resolved: Dict[str, str] = {}
+
+        def _resolve(key: str, chain: Optional[list] = None) -> Optional[str]:
+            if key in resolved:
+                return resolved[key]
+
+            chain = (chain or []) + [key]
+            value = env_values.get(key)
+
+            if value is None:
+                return None
+
+            if not isinstance(value, str):
+                resolved[key] = value
+                return value
+
+            def _replace(match: re.Match) -> str:
+                var_name = match.group(1).strip()
+
+                if var_name in extra_sources:
+                    return str(extra_sources[var_name])
+
+                if var_name in os.environ:
+                    return os.environ[var_name]
+
+                if var_name in chain:
+                    logger.warning(
+                        "Detected circular environment placeholder reference",
+                        variable=var_name,
+                        chain=" -> ".join(chain + [var_name])
+                    )
+                    return match.group(0)
+
+                if var_name in env_values:
+                    nested = _resolve(var_name, chain)
+                    return "" if nested is None else str(nested)
+
+                logger.debug(
+                    "Placeholder value not found for environment variable",
+                    variable=var_name,
+                    referenced_by=key
+                )
+                return match.group(0)
+
+            new_value = self._PLACEHOLDER_PATTERN.sub(_replace, value)
+            resolved[key] = new_value
+            return new_value
+
+        final: Dict[str, str] = {}
+        for key in env_values.keys():
+            resolved_value = _resolve(key, [])
+            if resolved_value is not None:
+                final[key] = resolved_value
+
+        return final
 
     def _cleanup_process_manager_state(self, agent_app_id: str, pid: Optional[int]) -> None:
         """Clean up process manager state for dead/zombie processes.
@@ -496,40 +651,75 @@ class SupervisorState:
                 org_short_id=request.org_short_id,
                 agent_short_id=request.agent_short_id
             )
-            self.user_manager.ensure_directories(
+            directories = self.user_manager.ensure_directories(
                 agent_app_id,
                 org_short_id=request.org_short_id,
                 agent_short_id=request.agent_short_id
             )
+            packages_dir = directories.get("packages", Path(home_dir) / "packages")
 
             logger.info("Created Linux user", agent_app_id=agent_app_id, user=username)
 
-            # Step 2: Handle port allocation
-            # Use PAC-provided ports if available, otherwise allocate internally
-            if request.ports:
-                # PAC provided ports - use them directly (DO NOT ALLOCATE)
-                ports = request.ports
+            # Step 2: Handle port/socket allocation based on socket_mode
+            # IMPORTANT: socket_mode=True (Unix sockets) is the ONLY supported mode.
+            # DEPRECATED: socket_mode=False (TCP ports) is deprecated and should NEVER be activated.
+            # Port mode has hard capacity limits (200 agents max) and is being phased out.
+            ports = None
+            socket_paths = None
+            socket_paths_model = None
+
+            if request.socket_mode:
+                # PREFERRED: Socket mode - allocate Unix domain socket paths
+                # This is the only mode that should be used in production.
+                socket_paths = self.socket_allocator.create_agent_directory(
+                    agent_app_id,
+                    owner=username,
+                    group="nginx",  # Nginx needs access to proxy to sockets
+                    short_id=request.agent_short_id,  # Use PAC-provided short_id for directory name
+                )
+                socket_paths_model = SocketPathsModel(
+                    base_dir=str(socket_paths.base_dir),
+                    rest=str(socket_paths.rest),
+                    a2a=str(socket_paths.a2a),
+                    ui=str(socket_paths.ui),
+                )
                 logger.info(
-                    "Using PAC-provided ports",
+                    "Allocated socket paths",
+                    agent_app_id=agent_app_id,
+                    base_dir=str(socket_paths.base_dir),
+                    rest=str(socket_paths.rest),
+                    a2a=str(socket_paths.a2a),
+                    ui=str(socket_paths.ui),
+                    source="socket_allocator",
+                    note="Unlimited agent capacity via Unix sockets"
+                )
+            elif request.ports:
+                # DEPRECATED: Port mode - DO NOT USE
+                # Port mode has hard capacity limits and should never be activated.
+                # TODO: Remove port mode support once all agents use socket mode.
+                ports = request.ports
+                logger.warning(
+                    "Using PAC-provided ports (DEPRECATED)",
                     agent_app_id=agent_app_id,
                     rest=ports.rest,
                     a2a=ports.a2a,
                     ui=ports.ui,
                     source="pac",
-                    note="PAC manages port lifecycle"
+                    deprecation_note="Port mode is deprecated. Migrate to socket_mode=True."
                 )
             else:
-                # Backward compatibility: allocate ports internally
+                # DEPRECATED: Backward compatibility - allocate ports internally
                 # This path is for old PAC versions or testing without PAC
+                # DO NOT USE - migrate to socket_mode=True instead.
                 ports = self.port_allocator.allocate(agent_app_id)
                 logger.warning(
-                    "PAC did not provide ports, allocated internally",
+                    "PAC did not provide ports, allocated internally (DEPRECATED)",
                     agent_app_id=agent_app_id,
                     rest=ports.rest,
                     a2a=ports.a2a,
                     ui=ports.ui,
                     source="par_internal",
-                    note="Consider upgrading PAC to use centralized allocation"
+                    deprecation_note="Port mode is deprecated. Migrate to socket_mode=True."
                 )
 
             # Create agent process record with allocated resources
@@ -538,7 +728,9 @@ class SupervisorState:
                 agent_app_id=agent_app_id,
                 deployment_id=request.deployment_id,
                 status=AgentStatus.STARTING,
+                socket_mode=request.socket_mode,
                 ports=ports,
+                socket_paths=socket_paths_model,
                 linux_user=username,
                 package_path="",  # Will update after download
                 package_url=request.package_url,
@@ -555,26 +747,29 @@ class SupervisorState:
             self.agents[agent_app_id] = agent_process
 
             # Step 3: Download package
-            package_path = self.package_downloader.download(
+            apkg_path = self.package_downloader.download(
                 request.package_url,
                 request.package_sha256,
             )
-            agent_process.package_path = str(package_path)
+            logger.info("Downloaded package", agent_app_id=agent_app_id, path=str(apkg_path))
 
-            logger.info("Downloaded package", agent_app_id=agent_app_id, path=str(package_path))
-
-            # Step 3.5: Extract .apkg (ZIP) to directory (Issue #18 fix)
-            # PAR needs to extract the ZIP before reading config files like deploy.json
-            extracted_dir = self.package_downloader.extract_package(
-                package_path,
-                package_sha256=request.package_sha256,
+            # Step 4: Extract package into agent's home directory packages folder
+            extract_suffix = request.deployment_id or agent_app_id
+            safe_suffix = self._sanitize_dir_name(extract_suffix, agent_app_id)
+            extract_path = packages_dir / safe_suffix
+            if extract_path.exists():
+                shutil.rmtree(extract_path)
+            extract_path.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(apkg_path, 'r') as zf:
+                zf.extractall(extract_path)
+            subprocess.run(
+                ["chown", "-R", f"{username}:{username}", str(extract_path)],
+                capture_output=True,
+                text=True,
+                check=True,
             )
-
-            logger.info(
-                "Extracted package",
-                agent_app_id=agent_app_id,
-                extracted_dir=str(extracted_dir)
-            )
+            agent_process.package_path = str(extract_path)
+            extracted_dir = extract_path
 
             # Step 3.6: Inject PAC environment into deploy.json (if provided)
             if request.env:
@@ -627,6 +822,8 @@ class SupervisorState:
                 linux_user=username,
                 package_path=extracted_dir,
                 ports=ports,
+                socket_paths=socket_paths,
+                socket_mode=request.socket_mode,
                 env=request.env,
                 package_env=package_env,
             )
@@ -652,11 +849,6 @@ class SupervisorState:
                 exc_info=True,
             )
 
-            # Update status
-            if agent_app_id in self.agents:
-                self.agents[agent_app_id].status = AgentStatus.FAILED
-                self.agents[agent_app_id].error_message = str(e)
-
             # Try to clean up resources
             try:
                 if self.process_manager.is_running(agent_app_id):
@@ -664,6 +856,65 @@ class SupervisorState:
             except Exception:
                 pass
 
+            # Release ports if allocated
+            try:
+                if agent_app_id in self.agents:
+                    # Ports were allocated, release them
+                    self.port_allocator.release(agent_app_id)
+            except Exception:
+                pass
+
+            # Remove from agents dict to allow retry
+            # This ensures failed deployments don't block future deployment attempts
+            if agent_app_id in self.agents:
+                logger.info(
+                    "Removing failed agent from state to allow retry",
+                    agent_app_id=agent_app_id,
+                    status=self.agents[agent_app_id].status.value if self.agents[agent_app_id].status else "unknown",
+                )
+                del self.agents[agent_app_id]
+
+            raise
+
+    def _force_remove_dir(self, path: Path) -> None:
+        """Recursively remove a directory, handling permission errors.
+
+        On Linux/Unix, this attempts to change ownership/permissions before deletion
+        if the standard rmtree fails.
+
+        Args:
+            path: Directory to remove
+        """
+        if not path.exists():
+            return
+
+        try:
+            shutil.rmtree(path)
+        except PermissionError:
+            # Permission denied - try to fix permissions and retry
+            logger.warning(
+                "Permission denied removing directory, attempting to fix permissions",
+                path=str(path)
+            )
+            try:
+                # Try to make everything writable and owned by current user
+                subprocess.run(
+                    ["chmod", "-R", "777", str(path)],
+                    capture_output=True,
+                    check=False
+                )
+                # Retry deletion
+                shutil.rmtree(path)
+                logger.info("Successfully removed directory after permission fix", path=str(path))
+            except Exception as e:
+                logger.error(
+                    "Failed to remove directory even after permission fix attempt",
+                    path=str(path),
+                    error=str(e)
+                )
+                raise
+        except Exception as e:
+            logger.error("Failed to remove directory", path=str(path), error=str(e))
             raise
 
     async def update(self, request: UpdateRequest) -> AgentProcess:
@@ -704,7 +955,7 @@ class SupervisorState:
             agent_process.status = AgentStatus.UPDATING
 
             # Download new package
-            package_path = self.package_downloader.download(
+            apkg_path = self.package_downloader.download(
                 request.package_url,
                 request.package_sha256,
                 force_refresh=True,  # Force download even if cached
@@ -712,24 +963,42 @@ class SupervisorState:
 
             logger.info("Downloaded new package", agent_app_id=agent_app_id)
 
-            # Extract .apkg (ZIP) to directory (Issue #18 fix)
-            extracted_dir = self.package_downloader.extract_package(
-                package_path,
-                package_sha256=request.package_sha256,
-                force_extract=True,  # Force re-extraction for updates
-            )
+            # Stop old process
+            if self.process_manager.is_running(agent_app_id):
+                self.process_manager.stop_agent(agent_app_id)
+                logger.info("Stopped old agent process", agent_app_id=agent_app_id)
 
-            logger.info(
-                "Extracted new package",
-                agent_app_id=agent_app_id,
-                extracted_dir=str(extracted_dir)
-            )
+            # Extract and load new package
+            username = agent_process.linux_user
+            home_dir = self.user_manager.get_home_dir(agent_app_id)
+            directories = self.user_manager.ensure_directories(agent_app_id)
+            packages_dir = directories.get("packages", Path(home_dir) / "packages")
+            extract_suffix = request.deployment_id or agent_app_id
+            safe_suffix = self._sanitize_dir_name(extract_suffix, agent_app_id)
+            extract_path = packages_dir / safe_suffix
+            
+            # Remove old extraction if exists
+            if extract_path.exists():
+                import shutil
+                shutil.rmtree(extract_path)
+            
+            # Extract APKG
+            extract_path.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(apkg_path, 'r') as zf:
+                zf.extractall(extract_path)
+            logger.info("Extracted new package", agent_app_id=agent_app_id, path=str(extract_path))
 
-            # Inject PAC environment into deploy.json (if provided)
+            # Change ownership to agent user
+            subprocess.run(
+                ["chown", "-R", f"{username}:{username}", str(extract_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            extracted_dir = extract_path
+
             if request.env:
                 deploy_json_path = extracted_dir / "deploy.json"
-
-                # Read existing deploy.json from extracted package
                 existing_deploy = {}
                 if deploy_json_path.exists():
                     try:
@@ -741,17 +1010,12 @@ class SupervisorState:
                             agent_app_id=agent_app_id,
                             error=str(e)
                         )
-
-                # Merge: existing config + PAC environment (PAC takes precedence)
                 deploy_config = {
                     **existing_deploy,
                     "environment": request.env
                 }
-
-                # Write merged config back to deploy.json
                 with open(deploy_json_path, 'w') as f:
                     json.dump(deploy_config, f, indent=2)
-
                 logger.info(
                     "Injected PAC environment into deploy.json",
                     agent_app_id=agent_app_id,
@@ -759,16 +1023,88 @@ class SupervisorState:
                     env_var_keys=list(request.env.keys())
                 )
 
-            # Stop old process
-            if self.process_manager.is_running(agent_app_id):
-                self.process_manager.stop_agent(agent_app_id)
-                logger.info("Stopped old agent process", agent_app_id=agent_app_id)
+            # Load package and create/update virtual environment
+            venvs_dir = home_dir / "venvs"
+            venvs_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["chown", "-R", f"{username}:{username}", str(venvs_dir)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            # Clean up old virtual environments for this agent_app_id
+            # This ensures requirements changes trigger fresh venv creation
+            old_venv_path = agent_process.venv_path
+            old_venv = None
+            if old_venv_path:
+                old_venv = Path(old_venv_path)
+                if old_venv.exists() and old_venv.parent == venvs_dir:
+                    logger.info(
+                        "Removing old virtual environment",
+                        agent_app_id=agent_app_id,
+                        old_venv=str(old_venv),
+                    )
+                    try:
+                        self._force_remove_dir(old_venv)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to remove old venv, continuing",
+                            agent_app_id=agent_app_id,
+                            old_venv=str(old_venv),
+                            error=str(e),
+                        )
+            
+            # Also clean up any other venvs for this agent_app_id (in case of multiple)
+            # Find all venvs starting with agent_app_id
+            if venvs_dir.exists():
+                for venv_item in venvs_dir.iterdir():
+                    if venv_item.is_dir() and venv_item.name.startswith(f"{agent_app_id}_"):
+                        if old_venv is None or venv_item != old_venv:  # Don't delete twice
+                            logger.info(
+                                "Removing old virtual environment",
+                                agent_app_id=agent_app_id,
+                                old_venv=str(venv_item),
+                            )
+                            try:
+                                self._force_remove_dir(venv_item)
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to remove old venv, continuing",
+                                    agent_app_id=agent_app_id,
+                                    old_venv=str(venv_item),
+                                    error=str(e),
+                                )
+
+            loader = PackageLoader(
+                packages_dir=packages_dir,
+                venvs_dir=venvs_dir,
+            )
+            
+            package = loader.load_package(extract_path, agent_app_id=agent_app_id)
+            logger.info(
+                "Package loaded with virtual environment",
+                agent_app_id=agent_app_id,
+                package_id=package.id,
+                venv_path=package.venv_path,
+            )
+
+            # Change ownership of venv to agent user
+            if package.venv_path:
+                venv_path = Path(package.venv_path)
+                subprocess.run(
+                    ["chown", "-R", f"{username}:{username}", str(venv_path)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
 
             # Update agent info
             agent_process.deployment_id = request.deployment_id
             agent_process.package_url = request.package_url
-            agent_process.package_path = str(package_path)
+            agent_process.package_path = str(extract_path)
             agent_process.package_sha256 = request.package_sha256
+            agent_process.venv_path = package.venv_path
 
             # Apply config updates if provided
             if request.max_package_size_mb is not None:
@@ -790,12 +1126,23 @@ class SupervisorState:
                     package_env_count=len(package_env),
                 )
 
-            # Spawn new process
+            # Spawn new process - convert socket_paths_model to SocketPaths if in socket mode
+            socket_paths = None
+            if agent_process.socket_mode and agent_process.socket_paths:
+                from pixell_runtime.supervisor.socket_allocator import SocketPaths
+                socket_paths = SocketPaths(
+                    base_dir=Path(agent_process.socket_paths.base_dir),
+                    rest=Path(agent_process.socket_paths.rest),
+                    a2a=Path(agent_process.socket_paths.a2a),
+                    ui=Path(agent_process.socket_paths.ui),
+                )
             pid = self.process_manager.spawn_agent(
                 agent_app_id=agent_app_id,
                 linux_user=agent_process.linux_user,
                 package_path=extracted_dir,
                 ports=agent_process.ports,
+                socket_paths=socket_paths,
+                socket_mode=agent_process.socket_mode,
                 env=request.env or {},
                 package_env=package_env,
             )
@@ -889,14 +1236,24 @@ class SupervisorState:
             )
             logger.info("Cleaned agent files", agent_app_id=agent_app_id)
 
+            # Clean up socket directory if agent was in socket mode
+            if agent_process.socket_mode:
+                cleanup_result = self.socket_allocator.cleanup(agent_app_id)
+                logger.info(
+                    "Cleaned up socket directory",
+                    agent_app_id=agent_app_id,
+                    cleaned=cleanup_result,
+                )
+
             # IMPORTANT: DO NOT release ports - PAC manages port lifecycle
             # Old code removed: self.port_allocator.release(agent_app_id)
-            logger.info(
-                "Ports NOT released by PAR - PAC manages port lifecycle",
-                agent_app_id=agent_app_id,
-                ports={"rest": agent_process.ports.rest, "a2a": agent_process.ports.a2a, "ui": agent_process.ports.ui},
-                note="PAC will release ports in database"
-            )
+            if agent_process.ports:
+                logger.info(
+                    "Ports NOT released by PAR - PAC manages port lifecycle",
+                    agent_app_id=agent_app_id,
+                    ports={"rest": agent_process.ports.rest, "a2a": agent_process.ports.a2a, "ui": agent_process.ports.ui},
+                    note="PAC will release ports in database"
+                )
 
             # Delete Linux user ONLY if explicitly requested
             if request.cleanup_user:

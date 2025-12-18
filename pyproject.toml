@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pixell-runtime"
-version = "0.2.1"
+version = "0.2.2"
 description = "Lightweight hosting layer for serving Agent Packages (APKGs)"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [
@@ -16,7 +16,6 @@ authors = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -39,8 +38,10 @@ dependencies = [
     "asyncio>=3.4.3",
     "aiofiles>=23.2.1",
     "cryptography>=42.0.0",
-    "grpcio>=1.59.0",
-    "protobuf>=5.27.0",
+    "grpcio>=1.76.0",
+    "protobuf>=4.0.0",
+    "sqlalchemy>=2.0.44",
+    "a2a-sdk[http-server]>=0.3.13",
     "psutil>=5.9.0",
     "click>=8.1.0",
 ]

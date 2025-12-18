@@ -32,9 +32,10 @@ class AgentExport(BaseModel):
 
 
 class A2AConfig(BaseModel):
-    """A2A (gRPC) configuration."""
+    """A2A configuration (supports both gRPC and HTTP)."""
     
     service: Optional[str] = Field(None, description="gRPC server entry (exports createGrpcServer())")
+    http_server: Optional[str] = Field(None, description="HTTP server entry (exports create_http_server() or main() that returns A2AStarletteApplication)")
 
 
 class RESTConfig(BaseModel):
@@ -67,10 +68,7 @@ class AgentManifest(BaseModel):
     a2a: Optional[A2AConfig] = Field(None, description="A2A (gRPC) configuration")
     rest: Optional[RESTConfig] = Field(None, description="REST API configuration")
     ui: Optional[UIConfig] = Field(None, description="UI serving configuration")
-
-    # Environment variables from agent.yaml
-    environment: Dict[str, str] = Field(default_factory=dict, description="Environment variables declared in agent.yaml")
-
+    
     @validator("runtime_version")
     def validate_runtime_version(cls, v: str) -> str:
         """Validate runtime version format."""
@@ -94,7 +92,6 @@ class AgentPackage(BaseModel):
     status: AgentStatus = Field(AgentStatus.PENDING)
     error: Optional[str] = Field(None, description="Error message if failed")
     venv_path: Optional[str] = Field(None, description="Virtual environment path")
-    environment: Dict[str, str] = Field(default_factory=dict, description="Merged environment variables from agent.yaml and deploy.json")
 
 
 class Agent(BaseModel):

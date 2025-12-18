@@ -1,0 +1,337 @@
+===============================================================================
+PIXELL AGENT RUNTIME - A2A REQUEST PROCESSING FLOW
+===============================================================================
+
+This diagram illustrates how the Pixell Agent Runtime receives and processes
+Agent-to-Agent (A2A) requests through AWS infrastructure and routes them to
+individual agent processes.
+
+Key Components:
+- AWS ALB: Entry point with TLS termination and path-based routing
+- GrpcGateway (port 60000): Routes to agents based on agent ID in path
+- PARRoutingInterceptor: Strips ALB routing prefixes before handler
+- AgentServiceImpl: Agent's A2A request handler with JSON-RPC 2.0 support
+
+Protocol: gRPC with JSON-RPC 2.0
+Capacity: 200 concurrent agents per EC2 instance
+
+===============================================================================
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│ CLIENT (talk_to_agent.py, PAC, or external agent)                         │
+│ Location: Laptop / Other EC2 / External service                           │
+└─────────────────────────────┬──────────────────────────────────────────────┘
+                              │
+                              │ gRPC Request (JSON-RPC 2.0)
+                              │ Host: par.pixell.global:443
+                              │ Path: /agents/4906eeb7/a2a/pixell.agent.AgentService/Invoke
+                              │ {
+                              │   "jsonrpc": "2.0",
+                              │   "id": "b36b456d-a7b8-4362-9e64-86e7e05e9e2e",
+                              │   "method": "message/send",
+                              │   "params": {
+                              │     "message": {
+                              │       "metadata": {"skill": "chat", "params": {...}},
+                              │       "parts": [{"text": "Hello!"}]
+                              │     }
+                              │   }
+                              │ }
+                              │
+                              ▼
+╔════════════════════════════════════════════════════════════════════════════╗
+║ AWS REGION: us-east-2 (Ohio)                                               ║
+╚════════════════════════════════════════════════════════════════════════════╝
+                              │
+                              ▼
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ STEP 1: APPLICATION LOAD BALANCER (ALB)                                ┃
+┃ Name: pixell-runtime-alb                                                ┃
+┃ DNS:  pixell-runtime-alb-420577088.us-east-2.elb.amazonaws.com        ┃
+┃       → par.pixell.global (CNAME)                                       ┃
+┃ IPs:  18.216.3.57, 18.219.207.35 (public)                              ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                              │
+                              │ Port: 443 (HTTPS/TLS)
+                              │
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ TLS TERMINATION                                                 │  ┃
+┃  │ Certificate: *.pixell.global (wildcard)                         │  ┃
+┃  │ Protocol: HTTPS → HTTP/2                                        │  ┃
+┃  └─────────────────────────┬───────────────────────────────────────┘  ┃
+┃                            │                                           ┃
+┃                            ▼                                           ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ PATH-BASED ROUTING RULES (Priority-based)                       │  ┃
+┃  │                                                                  │  ┃
+┃  │ Rule 10066: /agents/{id}/api/*  → REST target group            │  ┃
+┃  │             Target: pac-agent-{id}-rest (port 63000)            │  ┃
+┃  │                                                                  │  ┃
+┃  │ Rule 10067: /agents/{id}/a2a/*  → gRPC target group  ← MATCH!  │  ┃
+┃  │             Target: pac-agent-{id}-grpc (port 60000)            │  ┃
+┃  │                                                                  │  ┃
+┃  │ Rule 10068: /agents/{id}/*      → REST target group (default)   │  ┃
+┃  │             Target: pac-agent-{id}-rest (port 63000)            │  ┃
+┃  │                                                                  │  ┃
+┃  │ Decision: Request matches Rule 10067 (A2A pattern)              │  ┃
+┃  │   Path: /agents/4906eeb7/a2a/pixell.agent.AgentService/Invoke  │  ┃
+┃  │   Target: pac-agent-4906eeb7-grpc                               │  ┃
+┃  └─────────────────────────┬───────────────────────────────────────┘  ┃
+┃                            │                                           ┃
+┃                            ▼                                           ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ TARGET GROUP: pac-agent-4906eeb7-grpc                           │  ┃
+┃  │ Protocol: HTTP/2 (gRPC compatible)                              │  ┃
+┃  │ Port: 60000                                                      │  ┃
+┃  │                                                                  │  ┃
+┃  │ Health Check:                                                    │  ┃
+┃  │   Protocol: gRPC                                                │  ┃
+┃  │   Path: /agents/4906eeb7/a2a/health                             │  ┃
+┃  │   Interval: 30s                                                 │  ┃
+┃  │   Healthy threshold: 2                                          │  ┃
+┃  │   Unhealthy threshold: 2                                        │  ┃
+┃  │                                                                  │  ┃
+┃  │ Targets:                                                         │  ┃
+┃  │   ├─ i-09dcb7f387166efd0:60000  [healthy]                       │  ┃
+┃  │   │    Private IP: 10.0.1.37                                    │  ┃
+┃  │   │    Zone: us-east-2a                                         │  ┃
+┃  │   └─ (additional EC2 instances if scaled)                       │  ┃
+┃  └─────────────────────────┬───────────────────────────────────────┘  ┃
+                              │
+                              │ Forward to target
+                              │ Protocol: HTTP/2
+                              │ Port: 60000
+                              │
+                              ▼
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ STEP 2: EC2 INSTANCE                                                    ┃
+┃ Instance ID: i-09dcb7f387166efd0                                        ┃
+┃ Name: pixell-agent-runtime                                              ┃
+┃ Private IP: 10.0.1.37                                                   ┃
+┃ Public IP: 18.119.137.118                                               ┃
+┃ Type: t3.medium (2 vCPU, 4 GB RAM)                                      ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                              │
+                              │ Request arrives at 10.0.1.37:60000
+                              │
+                              ▼
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 3: GRPC GATEWAY (Port 60000)                               │  ┃
+┃  │ File: src/pixell_runtime/supervisor/grpc_gateway.py            │  ┃
+┃  │                                                                  │  ┃
+┃  │ GrpcGateway._handle_request() (lines 142-262)                   │  ┃
+┃  │                                                                  │  ┃
+┃  │ ┌──────────────────────────────────────────────────┐            │  ┃
+┃  │ │ 3.1: Parse Incoming Path                        │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Received path:                                   │            │  ┃
+┃  │ │   /agents/4906eeb7/a2a/pixell.agent.AgentService/Invoke      │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Regex pattern:                                   │            │  ┃
+┃  │ │   ^/agents/(?P<agent_id>[^/]+)/a2a/(?P<service_method>.+)$  │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Extracted:                                       │            │  ┃
+┃  │ │   agent_id = "4906eeb7"                          │            │  ┃
+┃  │ │   service_method = "pixell.agent.AgentService/Invoke"        │  ┃
+┃  │ └──────────────────────────────────────────────────┘            │  ┃
+┃  │                         │                                        │  ┃
+┃  │                         ▼                                        │  ┃
+┃  │ ┌──────────────────────────────────────────────────┐            │  ┃
+┃  │ │ 3.2: Lookup Agent in SupervisorState             │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ agent = supervisor_state.get_agent("4906eeb7")   │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Result:                                          │            │  ┃
+┃  │ │   agent_app_id: "4906eeb7-9959-414e-84c6-f2445822ebe4"       │  ┃
+┃  │ │   status: RUNNING                                │            │  ┃
+┃  │ │   ports:                                         │            │  ┃
+┃  │ │     rest: 63000                                  │            │  ┃
+┃  │ │     a2a:  60000  ← Target port!                  │            │  ┃
+┃  │ │     ui:   65000                                  │            │  ┃
+┃  │ │   linux_user: "agent_4906eeb7"                   │            │  ┃
+┃  │ │   pid: 12345                                     │            │  ┃
+┃  │ └──────────────────────────────────────────────────┘            │  ┃
+┃  │                         │                                        │  ┃
+┃  │                         ▼                                        │  ┃
+┃  │ ┌──────────────────────────────────────────────────┐            │  ┃
+┃  │ │ 3.3: Create Channel to Agent's A2A Server        │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ target_address = f"localhost:{agent.ports.a2a}"  │            │  ┃
+┃  │ │ target_address = "localhost:60000"               │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ channel = grpc.aio.insecure_channel(target_address)          │  ┃
+┃  │ └──────────────────────────────────────────────────┘            │  ┃
+┃  │                         │                                        │  ┃
+┃  │                         ▼                                        │  ┃
+┃  │ ┌──────────────────────────────────────────────────┐            │  ┃
+┃  │ │ 3.4: Forward Request with Clean Path             │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Original path (from ALB):                        │            │  ┃
+┃  │ │   /agents/4906eeb7/a2a/pixell.agent.AgentService/Invoke      │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Forward with FULL path (agent strips it):        │            │  ┃
+┃  │ │   /agents/4906eeb7/a2a/pixell.agent.AgentService/Invoke      │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Note: PARRoutingInterceptor will strip prefix    │            │  ┃
+┃  │ └──────────────────────────────────────────────────┘            │  ┃
+┃  └─────────────────────────┬───────────────────────────────────────┘  ┃
+┃                            │                                           ┃
+┃                            │ Forward to localhost:60000                ┃
+┃                            │                                           ┃
+┃                            ▼                                           ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 4: AGENT A2A SERVER (Port 60000)                           │  ┃
+┃  │ Process: python3.11 -m pixell_runtime (PID 12345)               │  ┃
+┃  │ User: agent_4906eeb7                                             │  ┃
+┃  │ File: src/pixell_runtime/a2a/server.py                          │  ┃
+┃  │                                                                  │  ┃
+┃  │ ┌──────────────────────────────────────────────────┐            │  ┃
+┃  │ │ 4.1: PARRoutingInterceptor (lines 81-149)       │            │  ┃
+┃  │ │ File: src/pixell_runtime/a2a/interceptor.py     │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Received path:                                   │            │  ┃
+┃  │ │   /agents/4906eeb7/a2a/pixell.agent.AgentService/Invoke      │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Strip prefix:                                    │            │  ┃
+┃  │ │   prefix = "/agents/4906eeb7/a2a"               │            │  ┃
+┃  │ │   stripped_method = original_method[len(prefix):]            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Clean path (for agent handler):                  │            │  ┃
+┃  │ │   /pixell.agent.AgentService/Invoke              │            │  ┃
+┃  │ └──────────────────────────────────────────────────┘            │  ┃
+┃  │                         │                                        │  ┃
+┃  │                         ▼                                        │  ┃
+┃  │ ┌──────────────────────────────────────────────────┐            │  ┃
+┃  │ │ 4.2: AgentServiceImpl.Invoke() (lines 56-254)   │            │  ┃
+┃  │ │ File: src/pixell_runtime/a2a/server.py          │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Parse A2A JSON-RPC 2.0 format:                   │            │  ┃
+┃  │ │   if request.HasField("message"):                │            │  ┃
+┃  │ │     a2a_msg = request.message                    │            │  ┃
+┃  │ │     request_id = a2a_msg.id                      │            │  ┃
+┃  │ │     request_id = "b36b456d-a7b8-4362-9e64..."    │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │     params = json.loads(a2a_msg.params_json)     │            │  ┃
+┃  │ │     message = params["message"]                  │            │  ┃
+┃  │ │     metadata = message["metadata"]               │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │     action = metadata["skill"]  # "chat"         │            │  ┃
+┃  │ │     parameters = metadata["params"]              │            │  ┃
+┃  │ └──────────────────────────────────────────────────┘            │  ┃
+┃  │                         │                                        │  ┃
+┃  │                         ▼                                        │  ┃
+┃  │ ┌──────────────────────────────────────────────────┐            │  ┃
+┃  │ │ 4.3: Route to Handler (lines 158-236)           │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Three routing patterns:                          │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Pattern 1: Custom Python Handlers                │            │  ┃
+┃  │ │   if action in self.handlers:                    │            │  ┃
+┃  │ │     handler_fn = self.handlers[action]           │            │  ┃
+┃  │ │     result = await handler_fn(parameters)        │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Pattern 2: Subprocess Forwarding (MOST COMMON)   │            │  ┃
+┃  │ │   elif self.servicer:                            │            │  ┃
+┃  │ │     # Forward to agent's own gRPC server         │            │  ┃
+┃  │ │     channel = grpc.aio.insecure_channel(        │            │  ┃
+┃  │ │       f"localhost:{self.agent_a2a_port}"         │            │  ┃
+┃  │ │     )                                            │            │  ┃
+┃  │ │     stub = AgentServiceStub(channel)             │            │  ┃
+┃  │ │     response = await stub.Invoke(request)        │            │  ┃
+┃  │ │                                                   │            │  ┃
+┃  │ │ Pattern 3: Default (No Handler)                  │            │  ┃
+┃  │ │   else:                                          │            │  ┃
+┃  │ │     return error("No handler found")             │            │  ┃
+┃  │ └──────────────────────────────────────────────────┘            │  ┃
+┃  └─────────────────────────┬───────────────────────────────────────┘  ┃
+┃                            │                                           ┃
+┃                            ▼                                           ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 5: AGENT BUSINESS LOGIC                                    │  ┃
+┃  │ Location: Agent's custom code (in virtual environment)           │  ┃
+┃  │ Path: /var/lib/pixell/extracted/xyz789abc123/src/               │  ┃
+┃  │                                                                  │  ┃
+┃  │ Example: Chat agent                                              │  ┃
+┃  │   def handle_chat(params):                                       │  ┃
+┃  │     message = params["message"]                                  │  ┃
+┃  │     response = llm.generate(message)                             │  ┃
+┃  │     return {"reply": response}                                   │  ┃
+┃  │                                                                  │  ┃
+┃  │ Agent processes request and generates response                   │  ┃
+┃  └─────────────────────────┬───────────────────────────────────────┘  ┃
+┃                            │                                           ┃
+┃                            │ result = {"reply": "Hello! How can..."}  ┃
+┃                            │                                           ┃
+┃                            ▼                                           ┃
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ STEP 6: BUILD RESPONSE                                           │  ┃
+┃  │ File: src/pixell_runtime/a2a/server.py (lines 227-254)          │  ┃
+┃  │                                                                  │  ┃
+┃  │ Calculate duration:                                              │  ┃
+┃  │   duration_ms = int((time.time() - start_time) * 1000)          │  ┃
+┃  │   duration_ms = 142  # milliseconds                              │  ┃
+┃  │                                                                  │  ┃
+┃  │ Build ActionResult protobuf:                                     │  ┃
+┃  │   return agent_pb2.ActionResult(                                 │  ┃
+┃  │     success=True,                                                │  ┃
+┃  │     result='{"reply": "Hello! How can I help you?"}',           │  ┃
+┃  │     error="",                                                    │  ┃
+┃  │     request_id="b36b456d-a7b8-4362-9e64-86e7e05e9e2e",          │  ┃
+┃  │     duration_ms=142,                                             │  ┃
+┃  │     metadata={}                                                  │  ┃
+┃  │   )                                                              │  ┃
+┃  └─────────────────────────┬───────────────────────────────────────┘  ┃
+┃                            │                                           ┃
+┃                            │ Response flows back through stack         ┃
+┃                            │                                           ┃
+                              │
+                              ▼
+┃  ┌─────────────────────────────────────────────────────────────────┐  ┃
+┃  │ RESPONSE PATH (Reverse Order)                                   │  ┃
+┃  │                                                                  │  ┃
+┃  │ Agent Handler (Step 5)                                           │  ┃
+┃  │   ↓                                                              │  ┃
+┃  │ AgentServiceImpl.Invoke() - Build ActionResult (Step 4.2)       │  ┃
+┃  │   ↓                                                              │  ┃
+┃  │ PARRoutingInterceptor - Pass through (Step 4.1)                 │  ┃
+┃  │   ↓                                                              │  ┃
+┃  │ GrpcGateway - Forward to ALB (Step 3)                           │  ┃
+┃  │   ↓                                                              │  ┃
+┃  │ EC2 Network (Step 2)                                             │  ┃
+┃  │   ↓                                                              │  ┃
+┃  │ ALB Target Group - Return to ALB (Step 1)                       │  ┃
+┃  │   ↓                                                              │  ┃
+┃  │ ALB - TLS encryption                                             │  ┃
+┃  │   ↓                                                              │  ┃
+┃  │ Internet                                                         │  ┃
+┃  │   ↓                                                              │  ┃
+┃  │ CLIENT - Receives response                                       │  ┃
+┃  └─────────────────────────────────────────────────────────────────┘  ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+===============================================================================
+REQUEST COMPLETE
+Total Time: ~150ms (network + processing + response)
+===============================================================================
+
+Key Points:
+1. AWS ALB: Entry point with TLS termination and path-based routing
+2. GrpcGateway: Routes to agents based on agent ID in path (50051→60000-60199)
+3. PARRoutingInterceptor: Strips ALB routing prefixes before handler
+4. Three Handler Patterns: Custom functions, subprocess forwarding, or default
+5. JSON-RPC 2.0: Standard A2A protocol with backward compatibility
+6. 200-Agent Capacity: Port ranges support 200 concurrent agents per EC2
+
+AWS Resources:
+- ALB: pixell-runtime-alb (par.pixell.global)
+- Target Groups: pac-agent-{id}-grpc (port 60000)
+- EC2: i-09dcb7f387166efd0 (10.0.1.37)
+- Port Allocation:
+  * A2A (gRPC): 60000-60199 (200 agents)
+  * REST: 63000-63199 (200 agents)
+  * UI: 65000-65199 (200 agents)
+
+File References:
+- GrpcGateway: src/pixell_runtime/supervisor/grpc_gateway.py:142-262
+- PARRoutingInterceptor: src/pixell_runtime/a2a/interceptor.py:81-149
+- AgentServiceImpl: src/pixell_runtime/a2a/server.py:56-254
+- A2A Router: src/pixell_runtime/a2a/router.py:140-182
